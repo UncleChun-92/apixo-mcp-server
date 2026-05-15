@@ -7,6 +7,9 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 - `apixo_generate_task`: submit a generation task to APiXO
 - `apixo_get_task_status`: query task status/result by `taskId`
 - `apixo_get_balance`: get current key balance
+- `apixo_list_models`: list model metadata from schema index
+- `apixo_get_model_schema`: fetch machine-readable schema for one model
+- Automatic version update reminder (npm registry check with cache)
 
 ## Requirements
 
@@ -18,6 +21,12 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 
 - `APIXO_API_KEY` (required): your APiXO key
 - `APIXO_BASE_URL` (optional): default is `https://api.apixo.ai`
+- `APIXO_MODEL_SCHEMA_INDEX_URL` (optional): default is `https://apixo.ai/docs/models/schemas/index.json`
+- `APIXO_MODEL_SCHEMA_BASE_URL` (optional): default is `https://apixo.ai/docs`
+- `APIXO_MODEL_SCHEMA_CACHE_TTL_MS` (optional): default `300000` (5 min cache)
+- `APIXO_UPDATE_CHECK_ENABLED` (optional): default `true`
+- `APIXO_UPDATE_CHECK_URL` (optional): default `https://registry.npmjs.org/%40apixo%2Fmcp-server/latest`
+- `APIXO_UPDATE_CHECK_TTL_MS` (optional): default `21600000` (6 hour cache)
 
 Windows PowerShell example:
 
@@ -80,6 +89,13 @@ Then point your MCP client config to the built entry:
 2. `npm login`
 3. `npm run check && npm run build`
 4. `npm publish --access public`
+
+## Update Reminder Behavior
+
+- The server checks the npm registry for the latest package version automatically.
+- If a newer version exists, the server logs an update message on startup.
+- Tool responses include an `update_notice` field only when an update is available.
+- No manual "check update" tool is required.
 
 ## License
 

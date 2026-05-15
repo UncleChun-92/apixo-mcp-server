@@ -11,6 +11,20 @@ const API_KEY_ENV = "APIXO_API_KEY";
 const BASE_URL_ENV = "APIXO_BASE_URL";
 const USER_AGENT = `${SERVER_NAME}/${SERVER_VERSION}`;
 
+const DEFAULT_MODEL_SCHEMA_INDEX_URL = "https://apixo.ai/docs/models/schemas/index.json";
+const DEFAULT_MODEL_SCHEMA_BASE_URL = "https://apixo.ai/docs";
+const MODEL_SCHEMA_INDEX_URL_ENV = "APIXO_MODEL_SCHEMA_INDEX_URL";
+const MODEL_SCHEMA_BASE_URL_ENV = "APIXO_MODEL_SCHEMA_BASE_URL";
+const MODEL_SCHEMA_CACHE_TTL_MS_ENV = "APIXO_MODEL_SCHEMA_CACHE_TTL_MS";
+const PACKAGE_NAME = "@apixo/mcp-server";
+const DEFAULT_UPDATE_CHECK_URL = `https://registry.npmjs.org/${encodeURIComponent(PACKAGE_NAME)}/latest`;
+const UPDATE_CHECK_ENABLED_ENV = "APIXO_UPDATE_CHECK_ENABLED";
+const UPDATE_CHECK_URL_ENV = "APIXO_UPDATE_CHECK_URL";
+const UPDATE_CHECK_TTL_MS_ENV = "APIXO_UPDATE_CHECK_TTL_MS";
+
+const DEFAULT_MODEL_SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_UPDATE_CHECK_TTL_MS = 6 * 60 * 60 * 1000;
+
 type JsonObject = Record<string, unknown>;
 
 interface ApixoEnvelope {
@@ -28,10 +42,72 @@ interface ApixoRequestResult {
   error?: string;
 }
 
+interface JsonFetchResult {
+  ok: boolean;
+  status: number;
+  data?: unknown;
+  rawText?: string;
+  error?: string;
+}
+
 interface RuntimeConfig {
   apiKey: string | null;
   baseUrl: string;
 }
+
+interface ModelSchemaConfig {
+  indexUrl: string;
+  baseUrl: string;
+  ttlMs: number;
+}
+
+interface UpdateCheckConfig {
+  enabled: boolean;
+  url: string;
+  ttlMs: number;
+}
+
+interface ModelSchemaIndexEntry {
+  model_id: string;
+  slug: string;
+  category: string;
+  title: string;
+  integration_type: string;
+  schema_path: string;
+  doc_path: string;
+}
+
+interface ModelSchemaIndexDoc {
+  schema_version?: string;
+  generated_at?: string;
+  total_models: number;
+  models: ModelSchemaIndexEntry[];
+}
+
+interface CachedModelSchemaIndex {
+  expiresAt: number;
+  payload: ModelSchemaIndexDoc;
+}
+
+interface UpdateStatusPayload {
+  enabled: boolean;
+  package_name: string;
+  current_version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  checked_at: string;
+  source: string;
+  update_command: string | null;
+  npx_hint: string;
+}
+
+interface CachedUpdateStatus {
+  expiresAt: number;
+  payload: UpdateStatusPayload;
+}
+
+let modelSchemaIndexCache: CachedModelSchemaIndex | null = null;
+let updateStatusCache: CachedUpdateStatus | null = null;
 
 function getRuntimeConfig(): RuntimeConfig {
   const apiKey = process.env[API_KEY_ENV]?.trim() ?? null;
@@ -41,6 +117,59 @@ function getRuntimeConfig(): RuntimeConfig {
   return {
     apiKey,
     baseUrl,
+  };
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (!value) {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+
+  return fallback;
+}
+
+function getModelSchemaConfig(): ModelSchemaConfig {
+  const indexUrlRaw = process.env[MODEL_SCHEMA_INDEX_URL_ENV]?.trim();
+  const baseUrlRaw = process.env[MODEL_SCHEMA_BASE_URL_ENV]?.trim();
+  const ttlRaw = process.env[MODEL_SCHEMA_CACHE_TTL_MS_ENV]?.trim();
+
+  return {
+    indexUrl: indexUrlRaw && indexUrlRaw.length > 0 ? indexUrlRaw : DEFAULT_MODEL_SCHEMA_INDEX_URL,
+    baseUrl: (baseUrlRaw && baseUrlRaw.length > 0 ? baseUrlRaw : DEFAULT_MODEL_SCHEMA_BASE_URL).replace(/\/+$/, ""),
+    ttlMs: parsePositiveInt(ttlRaw, DEFAULT_MODEL_SCHEMA_CACHE_TTL_MS),
+  };
+}
+
+function getUpdateCheckConfig(): UpdateCheckConfig {
+  const enabledRaw = process.env[UPDATE_CHECK_ENABLED_ENV]?.trim();
+  const urlRaw = process.env[UPDATE_CHECK_URL_ENV]?.trim();
+  const ttlRaw = process.env[UPDATE_CHECK_TTL_MS_ENV]?.trim();
+
+  return {
+    enabled: parseBoolean(enabledRaw, true),
+    url: urlRaw && urlRaw.length > 0 ? urlRaw : DEFAULT_UPDATE_CHECK_URL,
+    ttlMs: parsePositiveInt(ttlRaw, DEFAULT_UPDATE_CHECK_TTL_MS),
   };
 }
 
@@ -56,14 +185,287 @@ function toTextResult(payload: unknown, isError = false) {
   };
 }
 
-function missingKeyResult() {
-  return toTextResult(
+async function missingKeyResult() {
+  return toTextResultWithUpdate(
     {
       ok: false,
       error: `Missing API key. Set ${API_KEY_ENV} before starting the MCP server.`,
     },
     true,
   );
+}
+
+async function fetchJson(url: string): Promise<JsonFetchResult> {
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": USER_AGENT,
+      },
+    });
+
+    const rawText = await response.text();
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        rawText,
+        error: `HTTP ${response.status}`,
+      };
+    }
+
+    try {
+      const parsed = JSON.parse(rawText) as unknown;
+      return {
+        ok: true,
+        status: response.status,
+        data: parsed,
+        rawText,
+      };
+    } catch {
+      return {
+        ok: false,
+        status: response.status,
+        rawText,
+        error: "Invalid JSON response.",
+      };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error instanceof Error ? error.message : "Unknown network error",
+    };
+  }
+}
+
+interface ParsedSemver {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string | null;
+}
+
+function parseSemver(version: string): ParsedSemver | null {
+  const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    major: Number.parseInt(match[1], 10),
+    minor: Number.parseInt(match[2], 10),
+    patch: Number.parseInt(match[3], 10),
+    prerelease: match[4] ?? null,
+  };
+}
+
+function comparePrerelease(a: string | null, b: string | null): number {
+  if (a === b) {
+    return 0;
+  }
+  if (a === null) {
+    return 1;
+  }
+  if (b === null) {
+    return -1;
+  }
+
+  const aParts = a.split(".");
+  const bParts = b.split(".");
+  const length = Math.max(aParts.length, bParts.length);
+
+  for (let i = 0; i < length; i += 1) {
+    const aPart = aParts[i];
+    const bPart = bParts[i];
+
+    if (aPart == null) {
+      return -1;
+    }
+    if (bPart == null) {
+      return 1;
+    }
+    if (aPart === bPart) {
+      continue;
+    }
+
+    const aNum = Number.parseInt(aPart, 10);
+    const bNum = Number.parseInt(bPart, 10);
+    const aIsNum = Number.isFinite(aNum) && `${aNum}` === aPart;
+    const bIsNum = Number.isFinite(bNum) && `${bNum}` === bPart;
+
+    if (aIsNum && bIsNum) {
+      return aNum > bNum ? 1 : -1;
+    }
+    if (aIsNum && !bIsNum) {
+      return -1;
+    }
+    if (!aIsNum && bIsNum) {
+      return 1;
+    }
+
+    return aPart > bPart ? 1 : -1;
+  }
+
+  return 0;
+}
+
+function compareVersions(a: string, b: string): number {
+  const aParsed = parseSemver(a);
+  const bParsed = parseSemver(b);
+
+  if (!aParsed || !bParsed) {
+    if (a === b) {
+      return 0;
+    }
+    return a > b ? 1 : -1;
+  }
+
+  if (aParsed.major !== bParsed.major) {
+    return aParsed.major > bParsed.major ? 1 : -1;
+  }
+  if (aParsed.minor !== bParsed.minor) {
+    return aParsed.minor > bParsed.minor ? 1 : -1;
+  }
+  if (aParsed.patch !== bParsed.patch) {
+    return aParsed.patch > bParsed.patch ? 1 : -1;
+  }
+
+  return comparePrerelease(aParsed.prerelease, bParsed.prerelease);
+}
+
+function buildUpdateCommand(): string {
+  return `npm install -g ${PACKAGE_NAME}@latest`;
+}
+
+async function loadUpdateStatus(forceRefresh = false): Promise<
+  | { ok: true; payload: UpdateStatusPayload; cacheExpiresAt: number }
+  | { ok: false; error: string; status: number; source: string; response?: unknown }
+> {
+  const cfg = getUpdateCheckConfig();
+  const now = Date.now();
+
+  if (!cfg.enabled) {
+    return {
+      ok: true,
+      payload: {
+        enabled: false,
+        package_name: PACKAGE_NAME,
+        current_version: SERVER_VERSION,
+        latest_version: null,
+        update_available: false,
+        checked_at: new Date(now).toISOString(),
+        source: cfg.url,
+        update_command: null,
+        npx_hint: "Update checks are disabled by configuration.",
+      },
+      cacheExpiresAt: now + cfg.ttlMs,
+    };
+  }
+
+  if (!forceRefresh && updateStatusCache && updateStatusCache.expiresAt > now) {
+    return {
+      ok: true,
+      payload: updateStatusCache.payload,
+      cacheExpiresAt: updateStatusCache.expiresAt,
+    };
+  }
+
+  const fetched = await fetchJson(cfg.url);
+  if (!fetched.ok) {
+    if (Number(fetched.status) === 404) {
+      const payload: UpdateStatusPayload = {
+        enabled: true,
+        package_name: PACKAGE_NAME,
+        current_version: SERVER_VERSION,
+        latest_version: null,
+        update_available: false,
+        checked_at: new Date(now).toISOString(),
+        source: cfg.url,
+        update_command: null,
+        npx_hint: "Package is not published to npm yet. Update reminders will activate after first publish.",
+      };
+
+      const expiresAt = now + cfg.ttlMs;
+      updateStatusCache = {
+        expiresAt,
+        payload,
+      };
+
+      return {
+        ok: true,
+        payload,
+        cacheExpiresAt: expiresAt,
+      };
+    }
+
+    return {
+      ok: false,
+      error: fetched.error ?? "Failed to fetch latest package version.",
+      status: fetched.status,
+      source: cfg.url,
+      response: fetched.rawText ?? null,
+    };
+  }
+
+  const rawData = fetched.data;
+  const latestVersion =
+    rawData && typeof rawData === "object" && "version" in rawData && typeof rawData.version === "string"
+      ? rawData.version
+      : null;
+
+  if (!latestVersion) {
+    return {
+      ok: false,
+      error: "Latest package metadata does not include a version field.",
+      status: fetched.status,
+      source: cfg.url,
+      response: rawData ?? fetched.rawText ?? null,
+    };
+  }
+
+  const updateAvailable = compareVersions(latestVersion, SERVER_VERSION) > 0;
+  const payload: UpdateStatusPayload = {
+    enabled: true,
+    package_name: PACKAGE_NAME,
+    current_version: SERVER_VERSION,
+    latest_version: latestVersion,
+    update_available: updateAvailable,
+    checked_at: new Date(now).toISOString(),
+    source: cfg.url,
+    update_command: updateAvailable ? buildUpdateCommand() : null,
+    npx_hint: updateAvailable
+      ? "If the server is launched with npx, restart your MCP client session to pick up the new version."
+      : "Current version is up to date.",
+  };
+
+  const expiresAt = now + cfg.ttlMs;
+  updateStatusCache = {
+    expiresAt,
+    payload,
+  };
+
+  return {
+    ok: true,
+    payload,
+    cacheExpiresAt: expiresAt,
+  };
+}
+
+async function toTextResultWithUpdate(payload: JsonObject, isError = false) {
+  const resultPayload: JsonObject = { ...payload };
+  const updateStatus = await loadUpdateStatus(false);
+
+  if (updateStatus.ok) {
+    if (updateStatus.payload.update_available) {
+      resultPayload.update_notice = {
+        ...updateStatus.payload,
+        cache_expires_at: new Date(updateStatus.cacheExpiresAt).toISOString(),
+      };
+    }
+  }
+
+  return toTextResult(resultPayload, isError);
 }
 
 async function apixoRequest(
@@ -137,10 +539,216 @@ async function apixoRequest(
   }
 }
 
+async function loadModelSchemaIndex(forceRefresh = false): Promise<
+  | { ok: true; payload: ModelSchemaIndexDoc; sourceUrl: string; cacheExpiresAt: number }
+  | { ok: false; error: string; status?: number; sourceUrl: string; response?: unknown }
+> {
+  const cfg = getModelSchemaConfig();
+  const now = Date.now();
+
+  if (!forceRefresh && modelSchemaIndexCache && modelSchemaIndexCache.expiresAt > now) {
+    return {
+      ok: true,
+      payload: modelSchemaIndexCache.payload,
+      sourceUrl: cfg.indexUrl,
+      cacheExpiresAt: modelSchemaIndexCache.expiresAt,
+    };
+  }
+
+  const fetched = await fetchJson(cfg.indexUrl);
+  if (!fetched.ok) {
+    return {
+      ok: false,
+      error: fetched.error ?? "Failed to fetch model schema index.",
+      status: fetched.status,
+      sourceUrl: cfg.indexUrl,
+      response: fetched.rawText ?? null,
+    };
+  }
+
+  const data = fetched.data;
+  if (!data || typeof data !== "object") {
+    return {
+      ok: false,
+      error: "Model schema index payload is not an object.",
+      status: fetched.status,
+      sourceUrl: cfg.indexUrl,
+      response: fetched.rawText ?? null,
+    };
+  }
+
+  const payload = data as ModelSchemaIndexDoc;
+  if (!Array.isArray(payload.models)) {
+    return {
+      ok: false,
+      error: "Model schema index is missing models array.",
+      status: fetched.status,
+      sourceUrl: cfg.indexUrl,
+      response: data,
+    };
+  }
+
+  const expiresAt = now + cfg.ttlMs;
+  modelSchemaIndexCache = {
+    expiresAt,
+    payload,
+  };
+
+  return {
+    ok: true,
+    payload,
+    sourceUrl: cfg.indexUrl,
+    cacheExpiresAt: expiresAt,
+  };
+}
+
+function findModelIndexEntry(index: ModelSchemaIndexDoc, model: string): ModelSchemaIndexEntry | null {
+  const lookup = model.trim().toLowerCase();
+  if (lookup.length === 0) {
+    return null;
+  }
+
+  for (const item of index.models) {
+    if (item.model_id.toLowerCase() === lookup) {
+      return item;
+    }
+  }
+
+  for (const item of index.models) {
+    if (item.slug.toLowerCase() === lookup) {
+      return item;
+    }
+  }
+
+  return null;
+}
+
+async function loadModelSchemaByPath(schemaPath: string): Promise<JsonFetchResult> {
+  const cfg = getModelSchemaConfig();
+  const fullUrl = /^https?:\/\//i.test(schemaPath)
+    ? schemaPath
+    : new URL(schemaPath.replace(/^\/+/, ""), `${cfg.baseUrl}/`).toString();
+
+  return fetchJson(fullUrl);
+}
+
 const server = new McpServer({
   name: SERVER_NAME,
   version: SERVER_VERSION,
 });
+
+server.registerTool(
+  "apixo_list_models",
+  {
+    title: "List Models",
+    description: "List APiXO models from the published model schema index.",
+    inputSchema: {
+      category: z.string().optional().describe("Optional category filter, e.g. image, video, audio, text."),
+      integration_type: z.string().optional().describe("Optional filter, e.g. task_api or llm_gateway."),
+      force_refresh: z.boolean().optional().describe("When true, bypass in-memory cache and fetch latest index."),
+    },
+  },
+  async ({ category, integration_type, force_refresh }) => {
+    const loaded = await loadModelSchemaIndex(force_refresh ?? false);
+    if (!loaded.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: loaded.error,
+          status: loaded.status ?? 0,
+          source: loaded.sourceUrl,
+          response: loaded.response ?? null,
+        },
+        true,
+      );
+    }
+
+    const normalizedCategory = category?.trim().toLowerCase();
+    const normalizedIntegrationType = integration_type?.trim().toLowerCase();
+
+    const filtered = loaded.payload.models.filter((model) => {
+      if (normalizedCategory && model.category.toLowerCase() !== normalizedCategory) {
+        return false;
+      }
+
+      if (normalizedIntegrationType && model.integration_type.toLowerCase() !== normalizedIntegrationType) {
+        return false;
+      }
+
+      return true;
+    });
+
+    return toTextResultWithUpdate({
+      ok: true,
+      source: loaded.sourceUrl,
+      cache_expires_at: new Date(loaded.cacheExpiresAt).toISOString(),
+      total_models: loaded.payload.total_models,
+      returned_models: filtered.length,
+      models: filtered,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_get_model_schema",
+  {
+    title: "Get Model Schema",
+    description: "Fetch one APiXO model schema document by model_id or slug.",
+    inputSchema: {
+      model: z.string().min(1).describe("Model ID or slug, e.g. kling-2-6 or nano-banana."),
+      force_refresh: z.boolean().optional().describe("When true, refresh schema index before lookup."),
+    },
+  },
+  async ({ model, force_refresh }) => {
+    const loaded = await loadModelSchemaIndex(force_refresh ?? false);
+    if (!loaded.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: loaded.error,
+          status: loaded.status ?? 0,
+          source: loaded.sourceUrl,
+          response: loaded.response ?? null,
+        },
+        true,
+      );
+    }
+
+    const matched = findModelIndexEntry(loaded.payload, model);
+    if (!matched) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: `Model not found in schema index: ${model}`,
+          source: loaded.sourceUrl,
+          hint: "Use apixo_list_models to inspect available model_id and slug values.",
+        },
+        true,
+      );
+    }
+
+    const fetched = await loadModelSchemaByPath(matched.schema_path);
+    if (!fetched.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: fetched.error ?? "Failed to fetch model schema file.",
+          status: fetched.status,
+          schema_path: matched.schema_path,
+          response: fetched.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      index_source: loaded.sourceUrl,
+      model: matched,
+      schema: fetched.data,
+    });
+  },
+);
 
 server.registerTool(
   "apixo_generate_task",
@@ -165,7 +773,7 @@ server.registerTool(
 
     const finalRequestType = request_type ?? "async";
     if (finalRequestType === "callback" && !callback_url) {
-      return toTextResult(
+      return toTextResultWithUpdate(
         {
           ok: false,
           error: "callback_url is required when request_type is callback.",
@@ -190,7 +798,7 @@ server.registerTool(
     });
 
     if (!result.ok) {
-      return toTextResult(
+      return toTextResultWithUpdate(
         {
           ok: false,
           error: result.error ?? "Failed to call APiXO generate task endpoint.",
@@ -201,7 +809,7 @@ server.registerTool(
       );
     }
 
-    return toTextResult({
+    return toTextResultWithUpdate({
       ok: true,
       endpoint: `/api/v1/generateTask/${model}`,
       response: result.envelope ?? result.rawText ?? null,
@@ -230,7 +838,7 @@ server.registerTool(
     });
 
     if (!result.ok) {
-      return toTextResult(
+      return toTextResultWithUpdate(
         {
           ok: false,
           error: result.error ?? "Failed to call APiXO status endpoint.",
@@ -241,7 +849,7 @@ server.registerTool(
       );
     }
 
-    return toTextResult({
+    return toTextResultWithUpdate({
       ok: true,
       endpoint: `/api/v1/statusTask/${model}`,
       taskId,
@@ -264,7 +872,7 @@ server.registerTool(
 
     const result = await apixoRequest(cfg, "GET", "/api/v1/apikeys/current-balance");
     if (!result.ok) {
-      return toTextResult(
+      return toTextResultWithUpdate(
         {
           ok: false,
           error: result.error ?? "Failed to call APiXO balance endpoint.",
@@ -275,7 +883,7 @@ server.registerTool(
       );
     }
 
-    return toTextResult({
+    return toTextResultWithUpdate({
       ok: true,
       endpoint: "/api/v1/apikeys/current-balance",
       response: result.envelope ?? result.rawText ?? null,
@@ -287,6 +895,25 @@ async function main(): Promise<void> {
   const cfg = getRuntimeConfig();
   if (!cfg.apiKey) {
     console.error(`[${SERVER_NAME}] Warning: ${API_KEY_ENV} is not set. Tool calls will fail until it is provided.`);
+  }
+
+  const schemaCfg = getModelSchemaConfig();
+  console.error(`[${SERVER_NAME}] Model schema index source: ${schemaCfg.indexUrl} (cache ${schemaCfg.ttlMs}ms)`);
+
+  const updateStatus = await loadUpdateStatus(false);
+  if (updateStatus.ok && updateStatus.payload.update_available) {
+    console.error(
+      `[${SERVER_NAME}] Update available: ${updateStatus.payload.current_version} -> ${updateStatus.payload.latest_version}.`,
+    );
+    if (updateStatus.payload.update_command) {
+      console.error(`[${SERVER_NAME}] Recommended update command: ${updateStatus.payload.update_command}`);
+    }
+    console.error(`[${SERVER_NAME}] ${updateStatus.payload.npx_hint}`);
+  }
+  if (!updateStatus.ok) {
+    console.error(
+      `[${SERVER_NAME}] Version check failed (${updateStatus.status}): ${updateStatus.error}. Source: ${updateStatus.source}`,
+    );
   }
 
   const transport = new StdioServerTransport();
