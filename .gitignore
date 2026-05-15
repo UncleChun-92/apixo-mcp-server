@@ -14,10 +14,10 @@ pnpm-debug.log*
 # environment
 .env
 .env.*
+!.env.example
 
 # editor / OS
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-
