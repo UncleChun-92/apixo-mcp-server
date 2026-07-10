@@ -12,6 +12,13 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 - `apixo_list_admin_contracts`: list published frontend-facing admin API contracts
 - `apixo_get_admin_contract`: fetch one published admin API contract
 - `apixo_search_admin_contracts`: search published admin API contracts
+- `apixo_list_mcp_users`: list MCP admin users (`mcp-token:manage`)
+- `apixo_create_mcp_user`: create an MCP admin user (`mcp-token:manage`)
+- `apixo_list_mcp_user_keys`: list one MCP user's keys (`mcp-token:manage`)
+- `apixo_create_mcp_token`: create a read-only MCP token (`mcp-token:manage`)
+- `apixo_revoke_mcp_token`: revoke an MCP token (`mcp-token:manage`)
+- `apixo_disable_mcp_user`: disable an MCP user (`mcp-token:manage`)
+- `apixo_list_mcp_access_logs`: list recent MCP access logs (`mcp-token:manage`)
 - Automatic version update reminder (npm registry check with cache)
 
 ## Requirements
@@ -23,7 +30,7 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 ## Environment Variables
 
 - `APIXO_API_KEY` (required): your APiXO key
-- `APIXO_MCP_TOKEN` (optional): contract-read token for `apixo_*_admin_contract*` tools
+- `APIXO_MCP_TOKEN` (optional): MCP token for admin contract read tools; if it also has `mcp-token:manage`, it can use MCP user/key management tools
 - `APIXO_BASE_URL` (optional): default is `https://api.apixo.ai`
 - `APIXO_MODEL_SCHEMA_INDEX_URL` (optional): default is `https://apixo.ai/docs/models/schemas/index.json`
 - `APIXO_MODEL_SCHEMA_BASE_URL` (optional): default is `https://apixo.ai/docs`
@@ -41,7 +48,23 @@ $env:APIXO_MCP_TOKEN = "your_mcp_contract_token"
 
 `APIXO_MCP_TOKEN` is separate from `APIXO_API_KEY`. Existing public model tools continue to use
 `APIXO_API_KEY`; admin contract tools use `APIXO_MCP_TOKEN` and only read published frontend-facing
-admin API contracts.
+admin API contracts. MCP management tools also use `APIXO_MCP_TOKEN`, but require the token to have
+`mcp-token:manage`. They can create only read-only `admin-contract:read` tokens; they cannot create a
+new `mcp-token:manage` token.
+
+## Safety Policy
+
+The server publishes MCP instructions that tell compatible clients to refuse sensitive internal
+questions. Allowed use is limited to published model schemas, public model task tools, published
+frontend-facing admin API contracts, and scoped MCP token management.
+
+Clients should refuse requests for internal source code, private repositories, database credentials,
+raw database contents, token values, token hashes, salts, upstream provider keys, internal provider
+endpoints, `real_model` mappings, fallback routes, deployment or SSH details, cache topology, billing
+implementation internals, or security bypass instructions.
+
+This policy is a client-facing guardrail, not a replacement for backend access control. The hosted
+APiXO API must still expose only published contracts and enforce `X-MCP-TOKEN` scopes server-side.
 
 ## Distribution Model
 
@@ -105,6 +128,11 @@ Then point your MCP client config to the built entry:
   }
 }
 ```
+
+## Team Operation Guide
+
+For a short Chinese, colleague-facing Codex setup guide—including chat-based token setup—see
+[docs/CODEX_MCP_ONBOARDING.md](docs/CODEX_MCP_ONBOARDING.md).
 
 ## Release Process (Maintainers)
 

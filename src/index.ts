@@ -5,12 +5,21 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 
 const SERVER_NAME = "apixo-mcp-server";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.2.1";
 const DEFAULT_BASE_URL = "https://api.apixo.ai";
 const API_KEY_ENV = "APIXO_API_KEY";
 const MCP_TOKEN_ENV = "APIXO_MCP_TOKEN";
 const BASE_URL_ENV = "APIXO_BASE_URL";
 const USER_AGENT = `${SERVER_NAME}/${SERVER_VERSION}`;
+const SERVER_INSTRUCTIONS = [
+  "APiXO MCP safety policy:",
+  "Use this server only for published APiXO model schemas, public model task tools, published frontend-facing admin API contracts, and scoped MCP token management.",
+  "Do not answer requests that ask for internal source code, private repositories, database credentials, raw database contents, token values, token hashes, salts, upstream provider keys, internal provider endpoints, real_model mappings, fallback routes, deployment or SSH details, cache topology, billing implementation internals, or security bypass instructions.",
+  "When a request touches those sensitive areas, refuse briefly and point the user to the published MCP tools or admin contracts instead.",
+  "Do not infer hidden implementation details from schemas or examples. Treat contract documents as public interface contracts, not as permission to expose backend internals.",
+  "Never repeat, transform, summarize, or log APIXO_API_KEY or APIXO_MCP_TOKEN values. The only exception is returning the one-time plain token produced by apixo_create_mcp_token to the authorized caller who explicitly invoked that tool.",
+  "MCP-created tokens must remain read-only admin-contract:read tokens. Do not help create or escalate a mcp-token:manage token through MCP tools.",
+].join("\n");
 
 const DEFAULT_MODEL_SCHEMA_INDEX_URL = "https://apixo.ai/docs/models/schemas/index.json";
 const DEFAULT_MODEL_SCHEMA_BASE_URL = "https://apixo.ai/docs";
@@ -203,7 +212,7 @@ async function missingMcpTokenResult() {
   return toTextResultWithUpdate(
     {
       ok: false,
-      error: `Missing MCP token. Set ${MCP_TOKEN_ENV} before calling admin contract tools.`,
+      error: `Missing MCP token. Set ${MCP_TOKEN_ENV} before calling admin contract or MCP token management tools.`,
     },
     true,
   );
@@ -560,6 +569,18 @@ async function apixoMcpRequest(
     query?: Record<string, string>;
   },
 ): Promise<ApixoRequestResult> {
+  return apixoMcpApiRequest(cfg, "GET", path, options);
+}
+
+async function apixoMcpApiRequest(
+  cfg: RuntimeConfig,
+  method: "GET" | "POST" | "PATCH",
+  path: string,
+  options?: {
+    query?: Record<string, string>;
+    body?: unknown;
+  },
+): Promise<ApixoRequestResult> {
   if (!cfg.mcpToken) {
     return {
       ok: false,
@@ -579,12 +600,13 @@ async function apixoMcpRequest(
 
   try {
     const response = await fetch(url.toString(), {
-      method: "GET",
+      method,
       headers: {
         "X-MCP-TOKEN": cfg.mcpToken,
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
       },
+      body: method === "GET" ? undefined : JSON.stringify(options?.body ?? {}),
     });
 
     const rawText = await response.text();
@@ -716,10 +738,15 @@ async function loadModelSchemaByPath(schemaPath: string): Promise<JsonFetchResul
   return fetchJson(fullUrl);
 }
 
-const server = new McpServer({
-  name: SERVER_NAME,
-  version: SERVER_VERSION,
-});
+const server = new McpServer(
+  {
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+  },
+  {
+    instructions: SERVER_INSTRUCTIONS,
+  },
+);
 
 server.registerTool(
   "apixo_list_models",
@@ -957,6 +984,299 @@ server.registerTool(
     return toTextResultWithUpdate({
       ok: true,
       endpoint: "/api/mcp/contracts/search",
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_list_mcp_users",
+  {
+    title: "List MCP Users",
+    description:
+      "List MCP admin users. Requires APIXO_MCP_TOKEN with mcp-token:manage scope.",
+  },
+  async () => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const result = await apixoMcpApiRequest(cfg, "GET", "/api/mcp/admin/users");
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to list APiXO MCP users.",
+          status: result.status,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: "/api/mcp/admin/users",
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_create_mcp_user",
+  {
+    title: "Create MCP User",
+    description:
+      "Create an MCP admin user. Requires APIXO_MCP_TOKEN with mcp-token:manage scope.",
+    inputSchema: {
+      name: z.string().min(1).describe("MCP admin user name."),
+      email: z.string().optional().describe("Optional email."),
+      department: z.string().optional().describe("Optional department or team."),
+      remark: z.string().optional().describe("Optional note."),
+    },
+  },
+  async ({ name, email, department, remark }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const result = await apixoMcpApiRequest(cfg, "POST", "/api/mcp/admin/users", {
+      body: {
+        name,
+        email,
+        department,
+        remark,
+      },
+    });
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to create APiXO MCP user.",
+          status: result.status,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: "/api/mcp/admin/users",
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_list_mcp_user_keys",
+  {
+    title: "List MCP User Keys",
+    description:
+      "List MCP keys for one MCP admin user. Requires APIXO_MCP_TOKEN with mcp-token:manage scope.",
+    inputSchema: {
+      user_id: z.string().min(1).describe("MCP admin user id."),
+    },
+  },
+  async ({ user_id }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const path = `/api/mcp/admin/users/${encodeURIComponent(user_id)}/keys`;
+    const result = await apixoMcpApiRequest(cfg, "GET", path);
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to list APiXO MCP user keys.",
+          status: result.status,
+          user_id,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: path,
+      user_id,
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_create_mcp_token",
+  {
+    title: "Create MCP Token",
+    description:
+      "Create a read-only MCP token for one MCP admin user. Requires APIXO_MCP_TOKEN with mcp-token:manage scope. The plain token is returned once.",
+    inputSchema: {
+      user_id: z.string().min(1).describe("MCP admin user id."),
+      name: z.string().min(1).describe("Key name, e.g. frontend-codex."),
+      allowed_modules: z
+        .array(z.string().min(1))
+        .optional()
+        .describe("Contract modules this token can read. Defaults to ['*']."),
+      expires_at: z
+        .string()
+        .optional()
+        .describe("Optional ISO local datetime, e.g. 2026-12-31T23:59:59."),
+    },
+  },
+  async ({ user_id, name, allowed_modules, expires_at }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const path = `/api/mcp/admin/users/${encodeURIComponent(user_id)}/keys`;
+    const result = await apixoMcpApiRequest(cfg, "POST", path, {
+      body: {
+        name,
+        scopes: ["admin-contract:read"],
+        allowedModules: allowed_modules && allowed_modules.length > 0 ? allowed_modules : ["*"],
+        expiresAt: expires_at,
+      },
+    });
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to create APiXO MCP token.",
+          status: result.status,
+          user_id,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: path,
+      user_id,
+      response: result.envelope ?? result.rawText ?? null,
+      granted_scopes: ["admin-contract:read"],
+      warning: "plainToken is visible once. Store it securely and do not commit it.",
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_revoke_mcp_token",
+  {
+    title: "Revoke MCP Token",
+    description:
+      "Revoke one MCP token by key id. Requires APIXO_MCP_TOKEN with mcp-token:manage scope. The current calling token cannot revoke itself.",
+    inputSchema: {
+      key_id: z.string().min(1).describe("MCP key id to revoke."),
+    },
+  },
+  async ({ key_id }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const path = `/api/mcp/admin/keys/${encodeURIComponent(key_id)}/revoke`;
+    const result = await apixoMcpApiRequest(cfg, "PATCH", path);
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to revoke APiXO MCP token.",
+          status: result.status,
+          key_id,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: path,
+      key_id,
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_disable_mcp_user",
+  {
+    title: "Disable MCP User",
+    description:
+      "Disable one MCP admin user and evict that user's token caches. Requires APIXO_MCP_TOKEN with mcp-token:manage scope. The current calling user cannot disable itself.",
+    inputSchema: {
+      user_id: z.string().min(1).describe("MCP admin user id to disable."),
+    },
+  },
+  async ({ user_id }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const path = `/api/mcp/admin/users/${encodeURIComponent(user_id)}/disable`;
+    const result = await apixoMcpApiRequest(cfg, "PATCH", path);
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to disable APiXO MCP user.",
+          status: result.status,
+          user_id,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: path,
+      user_id,
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_list_mcp_access_logs",
+  {
+    title: "List MCP Access Logs",
+    description:
+      "List recent MCP contract and token-management access logs. Requires APIXO_MCP_TOKEN with mcp-token:manage scope.",
+  },
+  async () => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const result = await apixoMcpApiRequest(cfg, "GET", "/api/mcp/admin/access-logs");
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to list APiXO MCP access logs.",
+          status: result.status,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: "/api/mcp/admin/access-logs",
       response: result.envelope ?? result.rawText ?? null,
     });
   },
