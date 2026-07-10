@@ -9,6 +9,9 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 - `apixo_get_balance`: get current key balance
 - `apixo_list_models`: list model metadata from schema index
 - `apixo_get_model_schema`: fetch machine-readable schema for one model
+- `apixo_list_admin_contracts`: list published frontend-facing admin API contracts
+- `apixo_get_admin_contract`: fetch one published admin API contract
+- `apixo_search_admin_contracts`: search published admin API contracts
 - Automatic version update reminder (npm registry check with cache)
 
 ## Requirements
@@ -20,6 +23,7 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 ## Environment Variables
 
 - `APIXO_API_KEY` (required): your APiXO key
+- `APIXO_MCP_TOKEN` (optional): contract-read token for `apixo_*_admin_contract*` tools
 - `APIXO_BASE_URL` (optional): default is `https://api.apixo.ai`
 - `APIXO_MODEL_SCHEMA_INDEX_URL` (optional): default is `https://apixo.ai/docs/models/schemas/index.json`
 - `APIXO_MODEL_SCHEMA_BASE_URL` (optional): default is `https://apixo.ai/docs`
@@ -32,7 +36,12 @@ Windows PowerShell example:
 
 ```powershell
 $env:APIXO_API_KEY = "your_apixo_key"
+$env:APIXO_MCP_TOKEN = "your_mcp_contract_token"
 ```
+
+`APIXO_MCP_TOKEN` is separate from `APIXO_API_KEY`. Existing public model tools continue to use
+`APIXO_API_KEY`; admin contract tools use `APIXO_MCP_TOKEN` and only read published frontend-facing
+admin API contracts.
 
 ## Local Development
 
@@ -60,7 +69,8 @@ Then point your MCP client config to the built entry:
       "command": "node",
       "args": ["F:/Program/apixo-mcp-server/dist/index.js"],
       "env": {
-        "APIXO_API_KEY": "your_apixo_key"
+        "APIXO_API_KEY": "your_apixo_key",
+        "APIXO_MCP_TOKEN": "your_optional_mcp_contract_token"
       }
     }
   }
@@ -76,7 +86,8 @@ Then point your MCP client config to the built entry:
       "command": "npx",
       "args": ["-y", "@apixo/mcp-server"],
       "env": {
-        "APIXO_API_KEY": "your_apixo_key"
+        "APIXO_API_KEY": "your_apixo_key",
+        "APIXO_MCP_TOKEN": "your_optional_mcp_contract_token"
       }
     }
   }

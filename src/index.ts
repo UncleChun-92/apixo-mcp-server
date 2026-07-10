@@ -5,9 +5,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 
 const SERVER_NAME = "apixo-mcp-server";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 const DEFAULT_BASE_URL = "https://api.apixo.ai";
 const API_KEY_ENV = "APIXO_API_KEY";
+const MCP_TOKEN_ENV = "APIXO_MCP_TOKEN";
 const BASE_URL_ENV = "APIXO_BASE_URL";
 const USER_AGENT = `${SERVER_NAME}/${SERVER_VERSION}`;
 
@@ -52,6 +53,7 @@ interface JsonFetchResult {
 
 interface RuntimeConfig {
   apiKey: string | null;
+  mcpToken: string | null;
   baseUrl: string;
 }
 
@@ -111,11 +113,13 @@ let updateStatusCache: CachedUpdateStatus | null = null;
 
 function getRuntimeConfig(): RuntimeConfig {
   const apiKey = process.env[API_KEY_ENV]?.trim() ?? null;
+  const mcpToken = process.env[MCP_TOKEN_ENV]?.trim() ?? null;
   const baseUrlRaw = process.env[BASE_URL_ENV]?.trim();
   const baseUrl = (baseUrlRaw && baseUrlRaw.length > 0 ? baseUrlRaw : DEFAULT_BASE_URL).replace(/\/+$/, "");
 
   return {
     apiKey,
+    mcpToken,
     baseUrl,
   };
 }
@@ -190,6 +194,16 @@ async function missingKeyResult() {
     {
       ok: false,
       error: `Missing API key. Set ${API_KEY_ENV} before starting the MCP server.`,
+    },
+    true,
+  );
+}
+
+async function missingMcpTokenResult() {
+  return toTextResultWithUpdate(
+    {
+      ok: false,
+      error: `Missing MCP token. Set ${MCP_TOKEN_ENV} before calling admin contract tools.`,
     },
     true,
   );
@@ -539,6 +553,76 @@ async function apixoRequest(
   }
 }
 
+async function apixoMcpRequest(
+  cfg: RuntimeConfig,
+  path: string,
+  options?: {
+    query?: Record<string, string>;
+  },
+): Promise<ApixoRequestResult> {
+  if (!cfg.mcpToken) {
+    return {
+      ok: false,
+      status: 0,
+      error: `Missing ${MCP_TOKEN_ENV}`,
+    };
+  }
+
+  const url = new URL(path, `${cfg.baseUrl}/`);
+  if (options?.query) {
+    for (const [key, value] of Object.entries(options.query)) {
+      if (value.trim().length > 0) {
+        url.searchParams.set(key, value);
+      }
+    }
+  }
+
+  try {
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        "X-MCP-TOKEN": cfg.mcpToken,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+      },
+    });
+
+    const rawText = await response.text();
+    let envelope: ApixoEnvelope | undefined;
+
+    if (rawText) {
+      try {
+        envelope = JSON.parse(rawText) as ApixoEnvelope;
+      } catch {
+        envelope = undefined;
+      }
+    }
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        envelope,
+        rawText,
+        error: `HTTP ${response.status}`,
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      envelope,
+      rawText,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error instanceof Error ? error.message : "Unknown network error",
+    };
+  }
+}
+
 async function loadModelSchemaIndex(forceRefresh = false): Promise<
   | { ok: true; payload: ModelSchemaIndexDoc; sourceUrl: string; cacheExpiresAt: number }
   | { ok: false; error: string; status?: number; sourceUrl: string; response?: unknown }
@@ -746,6 +830,134 @@ server.registerTool(
       index_source: loaded.sourceUrl,
       model: matched,
       schema: fetched.data,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_list_admin_contracts",
+  {
+    title: "List Admin API Contracts",
+    description:
+      "List published frontend-facing admin API contracts from APiXO. Uses APIXO_MCP_TOKEN and does not affect public model API tools.",
+    inputSchema: {
+      module: z.string().optional().describe("Optional admin module filter, e.g. api-key-admin."),
+      query: z.string().optional().describe("Optional text search across contract key, module, title, and description."),
+    },
+  },
+  async ({ module, query }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const q: Record<string, string> = {};
+    if (module) {
+      q.module = module;
+    }
+    if (query) {
+      q.q = query;
+    }
+
+    const result = await apixoMcpRequest(cfg, "/api/mcp/contracts", { query: q });
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to list APiXO admin API contracts.",
+          status: result.status,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: "/api/mcp/contracts",
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_get_admin_contract",
+  {
+    title: "Get Admin API Contract",
+    description:
+      "Fetch one published frontend-facing admin API contract by contract key. Uses APIXO_MCP_TOKEN.",
+    inputSchema: {
+      contract_key: z.string().min(1).describe("Contract key, e.g. admin.api-key.status."),
+    },
+  },
+  async ({ contract_key }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const result = await apixoMcpRequest(cfg, `/api/mcp/contracts/${encodeURIComponent(contract_key)}`);
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to fetch APiXO admin API contract.",
+          status: result.status,
+          contract_key,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: `/api/mcp/contracts/${contract_key}`,
+      contract_key,
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_search_admin_contracts",
+  {
+    title: "Search Admin API Contracts",
+    description:
+      "Search published frontend-facing admin API contracts. Uses APIXO_MCP_TOKEN and returns only contracts allowed for that MCP key.",
+    inputSchema: {
+      query: z.string().min(1).describe("Search text."),
+      module: z.string().optional().describe("Optional admin module filter."),
+    },
+  },
+  async ({ query, module }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.mcpToken) {
+      return missingMcpTokenResult();
+    }
+
+    const q: Record<string, string> = { q: query };
+    if (module) {
+      q.module = module;
+    }
+
+    const result = await apixoMcpRequest(cfg, "/api/mcp/contracts/search", { query: q });
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to search APiXO admin API contracts.",
+          status: result.status,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: "/api/mcp/contracts/search",
+      response: result.envelope ?? result.rawText ?? null,
     });
   },
 );
