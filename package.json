@@ -1,6 +1,6 @@
 {
   "name": "@apixo/mcp-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "APiXO MCP server for local tool integrations",
   "type": "module",
   "private": false,
