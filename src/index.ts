@@ -2,15 +2,15 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, hostname, platform } from "node:os";
 import { dirname, join } from "node:path";
 import * as z from "zod/v4";
+import { openBrowser } from "./browser.js";
 
 const SERVER_NAME = "apixo-mcp-server";
-const SERVER_VERSION = "0.3.1";
+const SERVER_VERSION = "0.3.2";
 const DEFAULT_BASE_URL = "https://api.apixo.ai";
 const API_KEY_ENV = "APIXO_API_KEY";
 const MCP_TOKEN_ENV = "APIXO_MCP_TOKEN";
@@ -351,50 +351,6 @@ function responseData<T>(result: JsonFetchResult): T | null {
     return null;
   }
   return (envelope.data ?? null) as T | null;
-}
-
-async function openBrowser(url: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (opened: boolean) => {
-      if (!settled) {
-        settled = true;
-        resolve(opened);
-      }
-    };
-
-    try {
-      const parsedUrl = new URL(url);
-      if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
-        finish(false);
-        return;
-      }
-
-      // The Windows command processor expands these characters before `start` receives its URL.
-      // Device authorization URLs are base64url-only; reject an unexpected value and return the
-      // verification_url fallback rather than risking command interpretation or URL corruption.
-      if (/["%&|<>^]/.test(url)) {
-        finish(false);
-        return;
-      }
-
-      const isWindows = platform() === "win32";
-      // explorer.exe accepts file-system arguments but does not reliably hand an HTTP(S) URL to the
-      // default browser. cmd's `start` command uses the registered URL protocol handler instead.
-      const command = isWindows ? (process.env.ComSpec || "cmd.exe") : platform() === "darwin" ? "open" : "xdg-open";
-      const args = isWindows
-        ? ["/d", "/s", "/c", `start \"\" \"${url}\"`]
-        : [url];
-      const child = spawn(command, args, { detached: true, stdio: "ignore" });
-      child.once("error", () => finish(false));
-      child.once("spawn", () => {
-        child.unref();
-        finish(true);
-      });
-    } catch {
-      finish(false);
-    }
-  });
 }
 
 function apiFailureMessage(result: JsonFetchResult, fallback: string): string {
