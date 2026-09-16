@@ -1,15 +1,14 @@
 # 在 Codex 中使用 APiXO MCP
 
-给前端同事的最短使用流程：**拿到两个 Token → 把下面的话发给 Codex → 重启一次 → 直接使用。**
+给前端同事的最短使用流程：**把下面的话发给 Codex → 浏览器登录 APiXO → 直接使用。**
 
 不需要自己安装 npm 包，也不需要手动编辑配置文件。
 
-## 先准备两个值 🔑
+## 只在需要后台合约时准备 MCP Token 🔑
 
-向 APiXO 负责人领取：
+普通模型、批次、余额等工具会在浏览器登录后自动配置专属 API Key，**不需要向负责人领取或手动填写**。
 
-- `APIXO_API_KEY`：正常调用 APiXO 模型、查余额时需要。
-- `APIXO_MCP_TOKEN`：查询后台接口合约时需要。
+只有查询后台接口合约时，才向 APiXO 负责人领取 `APIXO_MCP_TOKEN`。
 
 `X-MCP-TOKEN` 是请求头名称，**不用自己配置**。只要把第二个值交给 Codex，它会配置为
 `APIXO_MCP_TOKEN`，MCP 会自动带上 `X-MCP-TOKEN`。
@@ -18,7 +17,8 @@
 
 ## 只做这一件事：把这段话发给 Codex 🚀
 
-打开 Codex，创建一个新对话。将下面整段内容复制进去，再把两个占位符替换成你自己的值。
+打开 Codex，创建一个新对话。将下面整段内容复制进去；若你需要后台接口合约能力，再补上
+`APIXO_MCP_TOKEN`。
 
 ```text
 请帮我在这台电脑的 Codex 中配置 APiXO MCP，并直接更新当前用户的 Codex 配置。
@@ -27,18 +27,22 @@
 npx -y @apixo/mcp-server
 
 请配置以下环境变量：
-APIXO_API_KEY = "把这里替换成我的 APiXO API Key"
-APIXO_MCP_TOKEN = "把这里替换成我的 APiXO MCP Token"
+APIXO_MCP_CLIENT_TYPE = "codexCli"
 
 如果 apixo 已存在，请更新它，不要创建重复配置。
-不要修改当前项目里的任何文件，不要写入 .env，不要 Git 提交，也不要在回复中输出我的 Token。
-配置完成后，告诉我需要怎样重启 MCP，并确认配置的 MCP 名称是 apixo。
+不要修改当前项目里的任何文件，不要写入 .env，不要 Git 提交，也不要在回复中输出任何 Token。
+配置完成后，重启 MCP，并调用 apixo_setup。浏览器登录和批准后，再调用 apixo_finish_setup。
+确认配置的 MCP 名称是 apixo。
 ```
 
 Codex 会把 MCP 配置到当前电脑的用户级配置中；`npx` 会在首次启动时自动下载并启动
 `@apixo/mcp-server`，不需要手动安装 npm 包。
 
-如果你**不需要查询后台接口合约**，可以删除提示词中的 `APIXO_MCP_TOKEN` 那一行。
+如果你**需要查询后台接口合约**，再在 MCP 配置中加入：
+
+```text
+APIXO_MCP_TOKEN = "把这里替换成我的 APiXO MCP Token"
+```
 
 ## 高层管理员额外能力 🛡️
 
@@ -84,7 +88,7 @@ MCP 用户 / key 管理。
    请使用 APiXO MCP，列出我有权限查看的后台接口列表。
    ```
 
-能成功返回合约列表，就表示 MCP 已连接，并且合约 Token 可用。
+能成功返回模型列表，就表示 MCP 已完成浏览器登录并可用；能成功返回合约列表，则表示 MCP Token 也可用。
 
 如果 Codex 提示没有 `apixo` 工具或无法连接：重启 Codex 后再试一次；如果提示找不到
 `npx`，先安装 Node.js 20 或更高版本；仍不能使用时，把报错截图发给 APiXO 负责人即可。
