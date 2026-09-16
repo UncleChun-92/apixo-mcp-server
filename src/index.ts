@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import * as z from "zod/v4";
 
 const SERVER_NAME = "apixo-mcp-server";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.3.1";
 const DEFAULT_BASE_URL = "https://api.apixo.ai";
 const API_KEY_ENV = "APIXO_API_KEY";
 const MCP_TOKEN_ENV = "APIXO_MCP_TOKEN";
@@ -364,8 +364,28 @@ async function openBrowser(url: string): Promise<boolean> {
     };
 
     try {
-      const command = platform() === "win32" ? "explorer.exe" : platform() === "darwin" ? "open" : "xdg-open";
-      const child = spawn(command, [url], { detached: true, stdio: "ignore" });
+      const parsedUrl = new URL(url);
+      if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+        finish(false);
+        return;
+      }
+
+      // The Windows command processor expands these characters before `start` receives its URL.
+      // Device authorization URLs are base64url-only; reject an unexpected value and return the
+      // verification_url fallback rather than risking command interpretation or URL corruption.
+      if (/["%&|<>^]/.test(url)) {
+        finish(false);
+        return;
+      }
+
+      const isWindows = platform() === "win32";
+      // explorer.exe accepts file-system arguments but does not reliably hand an HTTP(S) URL to the
+      // default browser. cmd's `start` command uses the registered URL protocol handler instead.
+      const command = isWindows ? (process.env.ComSpec || "cmd.exe") : platform() === "darwin" ? "open" : "xdg-open";
+      const args = isWindows
+        ? ["/d", "/s", "/c", `start \"\" \"${url}\"`]
+        : [url];
+      const child = spawn(command, args, { detached: true, stdio: "ignore" });
       child.once("error", () => finish(false));
       child.once("spawn", () => {
         child.unref();
