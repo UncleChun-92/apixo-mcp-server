@@ -5,7 +5,11 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 ## Features
 
 - `apixo_generate_task`: submit a generation task to APiXO
+- `apixo_setup` / `apixo_finish_setup`: sign in through the browser and configure this local installation
 - `apixo_get_task_status`: query task status/result by `taskId`
+- `apixo_submit_batch`: submit 1-50 asynchronous tasks for one model
+- `apixo_get_batch_status`: query a batch's progress, item states, and terminal public results
+- `apixo_get_batch_integration_guide`: read public batch and signed-webhook integration guidance without credentials
 - `apixo_get_balance`: get current key balance
 - `apixo_list_models`: list model metadata from schema index
 - `apixo_get_model_schema`: fetch machine-readable schema for one model
@@ -25,16 +29,20 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 
 - Node.js `>= 20`
 - npm `>= 9`
-- APiXO API key
+- APiXO browser sign-in through `apixo_setup`, or an explicit API key for task and account tools
 
 ## Environment Variables
 
 - `APIXO_API_KEY` (required): your APiXO key
+- `APIXO_MCP_CREDENTIALS_PATH` (optional): override the private local MCP credential-file location
+- `APIXO_MCP_CLIENT_TYPE` (optional): installation label, e.g. `codexCli`, `claudeCli`, or `claudeDesktop`
 - `APIXO_MCP_TOKEN` (optional): MCP token for admin contract read tools; if it also has `mcp-token:manage`, it can use MCP user/key management tools
 - `APIXO_BASE_URL` (optional): default is `https://api.apixo.ai`
 - `APIXO_MODEL_SCHEMA_INDEX_URL` (optional): default is `https://apixo.ai/docs/models/schemas/index.json`
 - `APIXO_MODEL_SCHEMA_BASE_URL` (optional): default is `https://apixo.ai/docs`
 - `APIXO_MODEL_SCHEMA_CACHE_TTL_MS` (optional): default `300000` (5 min cache)
+- `APIXO_BATCH_INTEGRATION_GUIDE_URL` (optional): default `https://apixo.ai/docs/mcp/guides/batch-integration-v1.json`
+- `APIXO_BATCH_INTEGRATION_GUIDE_CACHE_TTL_MS` (optional): default `300000` (5 min cache)
 - `APIXO_UPDATE_CHECK_ENABLED` (optional): default `true`
 - `APIXO_UPDATE_CHECK_URL` (optional): default `https://registry.npmjs.org/%40apixo%2Fmcp-server/latest`
 - `APIXO_UPDATE_CHECK_TTL_MS` (optional): default `21600000` (6 hour cache)
@@ -51,6 +59,18 @@ $env:APIXO_MCP_TOKEN = "your_mcp_contract_token"
 admin API contracts. MCP management tools also use `APIXO_MCP_TOKEN`, but require the token to have
 `mcp-token:manage`. They can create only read-only `admin-contract:read` tokens; they cannot create a
 new `mcp-token:manage` token.
+
+## Browser Setup
+
+For normal local use, start without `APIXO_API_KEY` and call `apixo_setup`. The MCP server opens APiXO
+in the browser; after the user signs in and approves the current device, call `apixo_finish_setup`.
+The resulting API key is written to a private local credential file that the MCP server reads on later
+starts. It is never returned in a tool response.
+
+`APIXO_API_KEY`, when explicitly configured, remains the highest-priority override for development and CI.
+Set `APIXO_MCP_CLIENT_TYPE` in the client configuration to make the corresponding API Key entry easy to
+identify in the APiXO dashboard. The server uses the local installation ID plus this client type to reuse
+the same key on later starts; a fresh installation creates its own key.
 
 ## Safety Policy
 
@@ -75,8 +95,9 @@ This project is distributed as an npm package; it is not deployed as a long-runn
 - `npx` downloads the package and starts it as a local stdio child process of the user's MCP client.
 - The running MCP process calls the hosted APiXO API, model documentation, and npm registry as needed.
 
-`.env.example` is documentation only. The server does not load it automatically; MCP clients must
-provide environment variables through their `env` configuration or the parent process environment.
+`.env.example` is documentation only. The server does not load it automatically. `APIXO_API_KEY` can be
+provided through client `env` configuration or the parent process environment; otherwise the browser
+setup flow stores a credential in the server's private local credential file.
 
 ## Local Development
 
@@ -104,7 +125,7 @@ Then point your MCP client config to the built entry:
       "command": "node",
       "args": ["F:/Program/apixo-mcp-server/dist/index.js"],
       "env": {
-        "APIXO_API_KEY": "your_apixo_key",
+        "APIXO_MCP_CLIENT_TYPE": "codexCli",
         "APIXO_MCP_TOKEN": "your_optional_mcp_contract_token"
       }
     }
@@ -121,7 +142,7 @@ Then point your MCP client config to the built entry:
       "command": "npx",
       "args": ["-y", "@apixo/mcp-server"],
       "env": {
-        "APIXO_API_KEY": "your_apixo_key",
+        "APIXO_MCP_CLIENT_TYPE": "codexCli",
         "APIXO_MCP_TOKEN": "your_optional_mcp_contract_token"
       }
     }

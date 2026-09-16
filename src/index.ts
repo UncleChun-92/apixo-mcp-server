@@ -2,23 +2,31 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "node:fs";
+import { homedir, hostname, platform } from "node:os";
+import { dirname, join } from "node:path";
 import * as z from "zod/v4";
 
 const SERVER_NAME = "apixo-mcp-server";
-const SERVER_VERSION = "0.2.1";
+const SERVER_VERSION = "0.3.0";
 const DEFAULT_BASE_URL = "https://api.apixo.ai";
 const API_KEY_ENV = "APIXO_API_KEY";
 const MCP_TOKEN_ENV = "APIXO_MCP_TOKEN";
 const BASE_URL_ENV = "APIXO_BASE_URL";
+const CREDENTIALS_PATH_ENV = "APIXO_MCP_CREDENTIALS_PATH";
+const CLIENT_TYPE_ENV = "APIXO_MCP_CLIENT_TYPE";
 const USER_AGENT = `${SERVER_NAME}/${SERVER_VERSION}`;
 const SERVER_INSTRUCTIONS = [
   "APiXO MCP safety policy:",
-  "Use this server only for published APiXO model schemas, public model task tools, published frontend-facing admin API contracts, and scoped MCP token management.",
+  "Use this server only for published APiXO model schemas, public batch integration guidance, public model task tools, published frontend-facing admin API contracts, and scoped MCP token management.",
   "Do not answer requests that ask for internal source code, private repositories, database credentials, raw database contents, token values, token hashes, salts, upstream provider keys, internal provider endpoints, real_model mappings, fallback routes, deployment or SSH details, cache topology, billing implementation internals, or security bypass instructions.",
   "When a request touches those sensitive areas, refuse briefly and point the user to the published MCP tools or admin contracts instead.",
   "Do not infer hidden implementation details from schemas or examples. Treat contract documents as public interface contracts, not as permission to expose backend internals.",
   "Never repeat, transform, summarize, or log APIXO_API_KEY or APIXO_MCP_TOKEN values. The only exception is returning the one-time plain token produced by apixo_create_mcp_token to the authorized caller who explicitly invoked that tool.",
   "MCP-created tokens must remain read-only admin-contract:read tokens. Do not help create or escalate a mcp-token:manage token through MCP tools.",
+  "Never retrieve, rotate, revoke, or return a batch webhook signing secret through MCP. Direct users to the published REST API or Dashboard secret-management flow.",
 ].join("\n");
 
 const DEFAULT_MODEL_SCHEMA_INDEX_URL = "https://apixo.ai/docs/models/schemas/index.json";
@@ -26,6 +34,9 @@ const DEFAULT_MODEL_SCHEMA_BASE_URL = "https://apixo.ai/docs";
 const MODEL_SCHEMA_INDEX_URL_ENV = "APIXO_MODEL_SCHEMA_INDEX_URL";
 const MODEL_SCHEMA_BASE_URL_ENV = "APIXO_MODEL_SCHEMA_BASE_URL";
 const MODEL_SCHEMA_CACHE_TTL_MS_ENV = "APIXO_MODEL_SCHEMA_CACHE_TTL_MS";
+const DEFAULT_BATCH_INTEGRATION_GUIDE_URL = "https://apixo.ai/docs/mcp/guides/batch-integration-v1.json";
+const BATCH_INTEGRATION_GUIDE_URL_ENV = "APIXO_BATCH_INTEGRATION_GUIDE_URL";
+const BATCH_INTEGRATION_GUIDE_CACHE_TTL_MS_ENV = "APIXO_BATCH_INTEGRATION_GUIDE_CACHE_TTL_MS";
 const PACKAGE_NAME = "@apixo/mcp-server";
 const DEFAULT_UPDATE_CHECK_URL = `https://registry.npmjs.org/${encodeURIComponent(PACKAGE_NAME)}/latest`;
 const UPDATE_CHECK_ENABLED_ENV = "APIXO_UPDATE_CHECK_ENABLED";
@@ -66,9 +77,44 @@ interface RuntimeConfig {
   baseUrl: string;
 }
 
+interface LocalCredentials {
+  version: 1;
+  installationId: string;
+  apiKey?: string;
+  pendingSetup?: PendingSetup;
+}
+
+interface PendingSetup {
+  deviceCode: string;
+  pollToken: string;
+  verificationUrl: string;
+  expiresAtEpochSeconds: number;
+  clientType: string;
+  hostLabel: string;
+}
+
+interface DeviceAuthorizationStartResponse {
+  verificationUrl: string;
+  deviceCode: string;
+  pollToken: string;
+  expiresAtEpochSeconds: number;
+  pollIntervalSeconds: number;
+}
+
+interface DeviceAuthorizationPollResponse {
+  status: "PENDING" | "AUTHORIZED";
+  pollIntervalSeconds?: number;
+  apiKey?: string;
+}
+
 interface ModelSchemaConfig {
   indexUrl: string;
   baseUrl: string;
+  ttlMs: number;
+}
+
+interface BatchIntegrationGuideConfig {
+  url: string;
   ttlMs: number;
 }
 
@@ -100,6 +146,18 @@ interface CachedModelSchemaIndex {
   payload: ModelSchemaIndexDoc;
 }
 
+interface BatchIntegrationGuideDocument {
+  guide_id?: string;
+  schema_version?: string;
+  sections?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+interface CachedBatchIntegrationGuide {
+  expiresAt: number;
+  payload: BatchIntegrationGuideDocument;
+}
+
 interface UpdateStatusPayload {
   enabled: boolean;
   package_name: string;
@@ -118,10 +176,13 @@ interface CachedUpdateStatus {
 }
 
 let modelSchemaIndexCache: CachedModelSchemaIndex | null = null;
+let batchIntegrationGuideCache: CachedBatchIntegrationGuide | null = null;
 let updateStatusCache: CachedUpdateStatus | null = null;
 
 function getRuntimeConfig(): RuntimeConfig {
-  const apiKey = process.env[API_KEY_ENV]?.trim() ?? null;
+  const environmentApiKey = process.env[API_KEY_ENV]?.trim() ?? null;
+  const localApiKey = environmentApiKey ? null : readLocalCredentials()?.apiKey?.trim() ?? null;
+  const apiKey = environmentApiKey || localApiKey;
   const mcpToken = process.env[MCP_TOKEN_ENV]?.trim() ?? null;
   const baseUrlRaw = process.env[BASE_URL_ENV]?.trim();
   const baseUrl = (baseUrlRaw && baseUrlRaw.length > 0 ? baseUrlRaw : DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -174,6 +235,168 @@ function getModelSchemaConfig(): ModelSchemaConfig {
   };
 }
 
+function credentialsPath(): string {
+  const configuredPath = process.env[CREDENTIALS_PATH_ENV]?.trim();
+  if (configuredPath) {
+    return configuredPath;
+  }
+
+  if (platform() === "win32") {
+    return join(process.env.LOCALAPPDATA?.trim() || join(homedir(), "AppData", "Local"), "APiXO", "mcp", "credentials.json");
+  }
+  if (platform() === "darwin") {
+    return join(homedir(), "Library", "Application Support", "APiXO", "mcp", "credentials.json");
+  }
+  return join(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"), "apixo", "mcp", "credentials.json");
+}
+
+function readLocalCredentials(): LocalCredentials | null {
+  const filePath = credentialsPath();
+  if (!existsSync(filePath)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Partial<LocalCredentials>;
+    if (parsed.version !== 1 || typeof parsed.installationId !== "string" || parsed.installationId.trim().length === 0) {
+      return null;
+    }
+    return {
+      version: 1,
+      installationId: parsed.installationId.trim(),
+      ...(typeof parsed.apiKey === "string" && parsed.apiKey.trim() ? { apiKey: parsed.apiKey.trim() } : {}),
+      ...(isPendingSetup(parsed.pendingSetup) ? { pendingSetup: parsed.pendingSetup } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isPendingSetup(value: unknown): value is PendingSetup {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const pending = value as Partial<PendingSetup>;
+  return typeof pending.deviceCode === "string"
+    && typeof pending.pollToken === "string"
+    && typeof pending.verificationUrl === "string"
+    && typeof pending.expiresAtEpochSeconds === "number"
+    && typeof pending.clientType === "string"
+    && typeof pending.hostLabel === "string";
+}
+
+function writeLocalCredentials(credentials: LocalCredentials): void {
+  const filePath = credentialsPath();
+  const directory = dirname(filePath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(directory, 0o700);
+  } catch {
+    // Windows ACL 管理由系统处理；不要因 POSIX mode 不可用而中断安装。
+  }
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+  writeFileSync(temporaryPath, `${JSON.stringify(credentials, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "w" });
+  try {
+    chmodSync(temporaryPath, 0o600);
+  } catch {
+    // Windows ACL 管理由系统处理；不要因 POSIX mode 不可用而中断安装。
+  }
+  renameSync(temporaryPath, filePath);
+}
+
+function normalizedHostLabel(): string {
+  const normalized = hostname().replace(/[^A-Za-z0-9._ -]/g, "-").trim().slice(0, 32);
+  return normalized || "local-host";
+}
+
+function normalizedClientType(value: string | undefined): string {
+  const candidate = value?.trim() || process.env[CLIENT_TYPE_ENV]?.trim() || "generic";
+  if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(candidate)) {
+    throw new Error("client_type must contain only letters, digits, underscore, or hyphen and start with a letter.");
+  }
+  return candidate;
+}
+
+async function postApiJson(baseUrl: string, path: string, body: unknown): Promise<JsonFetchResult> {
+  try {
+    const response = await fetch(new URL(path.replace(/^\/+/, ""), `${baseUrl}/`).toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify(body),
+    });
+    const rawText = await response.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(rawText) as unknown;
+    } catch {
+      return { ok: false, status: response.status, rawText, error: `HTTP ${response.status}` };
+    }
+    if (!response.ok) {
+      return { ok: false, status: response.status, data, rawText, error: `HTTP ${response.status}` };
+    }
+    return { ok: true, status: response.status, data, rawText };
+  } catch (error) {
+    return { ok: false, status: 0, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function responseData<T>(result: JsonFetchResult): T | null {
+  if (!result.ok || !result.data || typeof result.data !== "object") {
+    return null;
+  }
+  const envelope = result.data as ApixoEnvelope;
+  if (typeof envelope.code === "number" && envelope.code !== 200) {
+    return null;
+  }
+  return (envelope.data ?? null) as T | null;
+}
+
+async function openBrowser(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (opened: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve(opened);
+      }
+    };
+
+    try {
+      const command = platform() === "win32" ? "explorer.exe" : platform() === "darwin" ? "open" : "xdg-open";
+      const child = spawn(command, [url], { detached: true, stdio: "ignore" });
+      child.once("error", () => finish(false));
+      child.once("spawn", () => {
+        child.unref();
+        finish(true);
+      });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+function apiFailureMessage(result: JsonFetchResult, fallback: string): string {
+  if (result.data && typeof result.data === "object") {
+    const message = (result.data as ApixoEnvelope).message;
+    if (typeof message === "string" && message.trim()) {
+      return message;
+    }
+  }
+  return result.error || fallback;
+}
+
+function getBatchIntegrationGuideConfig(): BatchIntegrationGuideConfig {
+  const urlRaw = process.env[BATCH_INTEGRATION_GUIDE_URL_ENV]?.trim();
+  const ttlRaw = process.env[BATCH_INTEGRATION_GUIDE_CACHE_TTL_MS_ENV]?.trim();
+
+  return {
+    url: urlRaw && urlRaw.length > 0 ? urlRaw : DEFAULT_BATCH_INTEGRATION_GUIDE_URL,
+    ttlMs: parsePositiveInt(ttlRaw, DEFAULT_MODEL_SCHEMA_CACHE_TTL_MS),
+  };
+}
+
 function getUpdateCheckConfig(): UpdateCheckConfig {
   const enabledRaw = process.env[UPDATE_CHECK_ENABLED_ENV]?.trim();
   const urlRaw = process.env[UPDATE_CHECK_URL_ENV]?.trim();
@@ -202,7 +425,7 @@ async function missingKeyResult() {
   return toTextResultWithUpdate(
     {
       ok: false,
-      error: `Missing API key. Set ${API_KEY_ENV} before starting the MCP server.`,
+      error: `Missing API key. Run apixo_setup to sign in through APiXO, or set ${API_KEY_ENV} for an explicit local override.`,
     },
     true,
   );
@@ -498,6 +721,7 @@ async function apixoRequest(
   options?: {
     query?: Record<string, string>;
     body?: unknown;
+    headers?: Record<string, string>;
   },
 ): Promise<ApixoRequestResult> {
   if (!cfg.apiKey) {
@@ -522,6 +746,7 @@ async function apixoRequest(
         Authorization: `Bearer ${cfg.apiKey}`,
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
+        ...options?.headers,
       },
       body: method === "POST" ? JSON.stringify(options?.body ?? {}) : undefined,
     });
@@ -708,6 +933,60 @@ async function loadModelSchemaIndex(forceRefresh = false): Promise<
   };
 }
 
+async function loadBatchIntegrationGuide(forceRefresh = false): Promise<
+  | { ok: true; payload: BatchIntegrationGuideDocument; guideUrl: string; cacheExpiresAt: number }
+  | { ok: false; error: string; status?: number; guideUrl: string; response?: unknown }
+> {
+  const cfg = getBatchIntegrationGuideConfig();
+  const now = Date.now();
+
+  if (!forceRefresh && batchIntegrationGuideCache && batchIntegrationGuideCache.expiresAt > now) {
+    return {
+      ok: true,
+      payload: batchIntegrationGuideCache.payload,
+      guideUrl: cfg.url,
+      cacheExpiresAt: batchIntegrationGuideCache.expiresAt,
+    };
+  }
+
+  const fetched = await fetchJson(cfg.url);
+  if (!fetched.ok) {
+    return {
+      ok: false,
+      error: fetched.error ?? "Failed to fetch the batch integration guide.",
+      status: fetched.status,
+      guideUrl: cfg.url,
+      response: fetched.rawText ?? null,
+    };
+  }
+
+  const data = fetched.data;
+  if (!data || typeof data !== "object") {
+    return {
+      ok: false,
+      error: "Batch integration guide payload is not an object.",
+      status: fetched.status,
+      guideUrl: cfg.url,
+      response: data,
+    };
+  }
+
+  const payload = data as BatchIntegrationGuideDocument;
+  if (typeof payload.guide_id !== "string" || !payload.sections || typeof payload.sections !== "object") {
+    return {
+      ok: false,
+      error: "Batch integration guide is missing guide_id or sections.",
+      status: fetched.status,
+      guideUrl: cfg.url,
+      response: data,
+    };
+  }
+
+  const expiresAt = now + cfg.ttlMs;
+  batchIntegrationGuideCache = { expiresAt, payload };
+  return { ok: true, payload, guideUrl: cfg.url, cacheExpiresAt: expiresAt };
+}
+
 function findModelIndexEntry(index: ModelSchemaIndexDoc, model: string): ModelSchemaIndexEntry | null {
   const lookup = model.trim().toLowerCase();
   if (lookup.length === 0) {
@@ -857,6 +1136,245 @@ server.registerTool(
       index_source: loaded.sourceUrl,
       model: matched,
       schema: fetched.data,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_get_batch_integration_guide",
+  {
+    title: "Get Batch Integration Guide",
+    description:
+      "Read the public APiXO guide for batch submission, batch status, and signed webhooks. This is documentation-only: it does not require an API key and never returns a webhook secret.",
+    inputSchema: {
+      section: z
+        .enum(["all", "overview", "generate", "status", "webhooks"])
+        .optional()
+        .describe("Guide section to return. Defaults to all."),
+      force_refresh: z.boolean().optional().describe("When true, bypass the in-memory guide cache."),
+    },
+  },
+  async ({ section, force_refresh }) => {
+    const loaded = await loadBatchIntegrationGuide(force_refresh ?? false);
+    if (!loaded.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: loaded.error,
+          status: loaded.status ?? 0,
+          guide_url: loaded.guideUrl,
+          response: loaded.response ?? null,
+        },
+        true,
+      );
+    }
+
+    const selectedSection = section ?? "all";
+    const content = selectedSection === "all" ? loaded.payload : loaded.payload.sections?.[selectedSection];
+    if (selectedSection !== "all" && content === undefined) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: `Batch integration guide section is unavailable: ${selectedSection}`,
+          guide_url: loaded.guideUrl,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      guide_id: loaded.payload.guide_id,
+      schema_version: loaded.payload.schema_version ?? null,
+      section: selectedSection,
+      guide_url: loaded.guideUrl,
+      cache_expires_at: new Date(loaded.cacheExpiresAt).toISOString(),
+      content,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_setup",
+  {
+    title: "Set Up APiXO",
+    description:
+      "Open APiXO in your browser, sign in, and approve this local MCP installation. The API key is saved only in this MCP server's private local credential file and is never returned in the tool response.",
+    inputSchema: {
+      client_type: z
+        .string()
+        .optional()
+        .describe("Optional installing client identifier, e.g. codexCli, claudeCli, or claudeDesktop."),
+    },
+  },
+  async ({ client_type }) => {
+    const cfg = getRuntimeConfig();
+    if (cfg.apiKey) {
+      return toTextResultWithUpdate({
+        ok: true,
+        status: "ALREADY_CONFIGURED",
+        message: "APiXO MCP already has a local credential or an APIXO_API_KEY override.",
+      });
+    }
+
+    try {
+      const existing = readLocalCredentials();
+      const installationId = existing?.installationId || randomUUID().replace(/-/g, "");
+      const selectedClientType = normalizedClientType(client_type);
+      const hostLabel = normalizedHostLabel();
+      const nowEpochSeconds = Math.floor(Date.now() / 1000);
+      const pending = existing?.pendingSetup;
+      if (pending && pending.expiresAtEpochSeconds > nowEpochSeconds) {
+        const opened = await openBrowser(pending.verificationUrl);
+        return toTextResultWithUpdate({
+          ok: true,
+          status: "PENDING_APPROVAL",
+          verification_url: pending.verificationUrl,
+          browser_opened: opened,
+          message: opened
+            ? "A setup approval is already pending. Finish signing in, then call apixo_finish_setup."
+            : "A setup approval is already pending. Open verification_url in your browser, then call apixo_finish_setup.",
+        });
+      }
+
+      const started = await postApiJson(cfg.baseUrl, "/api/mcp/device-authorization/start", {
+        clientType: selectedClientType,
+        hostLabel,
+        installationId,
+      });
+      const data = responseData<DeviceAuthorizationStartResponse>(started);
+      if (!data
+        || typeof data.verificationUrl !== "string"
+        || typeof data.deviceCode !== "string"
+        || typeof data.pollToken !== "string"
+        || typeof data.expiresAtEpochSeconds !== "number") {
+        return toTextResultWithUpdate(
+          {
+            ok: false,
+            error: apiFailureMessage(started, "APiXO setup could not start."),
+          },
+          true,
+        );
+      }
+
+      const nextCredentials: LocalCredentials = {
+        version: 1,
+        installationId,
+        pendingSetup: {
+          deviceCode: data.deviceCode,
+          pollToken: data.pollToken,
+          verificationUrl: data.verificationUrl,
+          expiresAtEpochSeconds: data.expiresAtEpochSeconds,
+          clientType: selectedClientType,
+          hostLabel,
+        },
+      };
+      writeLocalCredentials(nextCredentials);
+      const opened = await openBrowser(data.verificationUrl);
+      return toTextResultWithUpdate({
+        ok: true,
+        status: "PENDING_APPROVAL",
+        verification_url: data.verificationUrl,
+        browser_opened: opened,
+        expires_at: new Date(data.expiresAtEpochSeconds * 1000).toISOString(),
+        message: opened
+          ? "Finish signing in and approving this device in the browser, then call apixo_finish_setup."
+          : "Open verification_url in your browser, approve this device, then call apixo_finish_setup.",
+      });
+    } catch (error) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: error instanceof Error ? error.message : "APiXO setup could not start.",
+        },
+        true,
+      );
+    }
+  },
+);
+
+server.registerTool(
+  "apixo_finish_setup",
+  {
+    title: "Finish APiXO Setup",
+    description:
+      "Check whether the browser approval completed. On success, stores the API key in this MCP server's private local credential file without returning it.",
+    inputSchema: {},
+  },
+  async () => {
+    const cfg = getRuntimeConfig();
+    if (cfg.apiKey) {
+      return toTextResultWithUpdate({
+        ok: true,
+        status: "ALREADY_CONFIGURED",
+        message: "APiXO MCP already has a local credential or an APIXO_API_KEY override.",
+      });
+    }
+
+    const credentials = readLocalCredentials();
+    const pending = credentials?.pendingSetup;
+    if (!credentials || !pending) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: "No APiXO setup is pending. Call apixo_setup first.",
+        },
+        true,
+      );
+    }
+    if (pending.expiresAtEpochSeconds <= Math.floor(Date.now() / 1000)) {
+      writeLocalCredentials({ version: 1, installationId: credentials.installationId });
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: "The APiXO setup approval expired. Call apixo_setup again.",
+        },
+        true,
+      );
+    }
+
+    const completed = await postApiJson(cfg.baseUrl, "/api/mcp/device-authorization/poll", {
+      deviceCode: pending.deviceCode,
+      pollToken: pending.pollToken,
+    });
+    const data = responseData<DeviceAuthorizationPollResponse>(completed);
+    if (!data || (data.status !== "PENDING" && data.status !== "AUTHORIZED")) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: apiFailureMessage(completed, "APiXO setup could not be completed."),
+        },
+        true,
+      );
+    }
+    if (data.status === "PENDING") {
+      return toTextResultWithUpdate({
+        ok: true,
+        status: "PENDING_APPROVAL",
+        message: "Browser approval has not completed yet. Finish the APiXO sign-in flow, then call apixo_finish_setup again.",
+      });
+    }
+    if (typeof data.apiKey !== "string" || data.apiKey.trim().length === 0) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: "APiXO setup returned an invalid credential response.",
+        },
+        true,
+      );
+    }
+
+    writeLocalCredentials({
+      version: 1,
+      installationId: credentials.installationId,
+      apiKey: data.apiKey.trim(),
+    });
+    return toTextResultWithUpdate({
+      ok: true,
+      status: "CONFIGURED",
+      client_type: pending.clientType,
+      host_label: pending.hostLabel,
+      message: "APiXO MCP is configured on this device. The credential is stored locally and was not returned.",
     });
   },
 );
@@ -1350,13 +1868,128 @@ server.registerTool(
 );
 
 server.registerTool(
+  "apixo_submit_batch",
+  {
+    title: "Submit Batch",
+    description:
+      "Submit 1 to 50 asynchronous APiXO generation tasks for one model. Uses the configured APIXO_API_KEY. Provide stable batch and item idempotency keys; use webhook_url only after configuring the signing secret through the REST API or Dashboard.",
+    inputSchema: {
+      model: z.string().min(1).describe("Public model ID for every item in the batch."),
+      idempotency_key: z
+        .string()
+        .min(1)
+        .describe("Stable batch-level idempotency key. Reuse it only when retrying the same business batch."),
+      items: z
+        .array(
+          z.object({
+            client_item_id: z.string().min(1).describe("Your unique business locator within this batch."),
+            idempotency_key: z
+              .string()
+              .min(1)
+              .describe("Stable account-level idempotency key for this item."),
+            input: z
+              .record(z.string(), z.unknown())
+              .describe("Normal public model input. Use apixo_get_model_schema for fields and constraints."),
+          }),
+        )
+        .min(1)
+        .max(50)
+        .describe("One to fifty items for the same model."),
+      webhook_url: z
+        .string()
+        .url()
+        .optional()
+        .describe("Optional public HTTPS endpoint for signed terminal item webhooks."),
+    },
+  },
+  async ({ model, idempotency_key, items, webhook_url }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.apiKey) {
+      return missingKeyResult();
+    }
+
+    const body: JsonObject = { items };
+    if (webhook_url) {
+      body.webhook_url = webhook_url;
+    }
+
+    const result = await apixoRequest(cfg, "POST", `/api/v1/generateTask/${encodeURIComponent(model)}/batches`, {
+      body,
+      headers: { "Idempotency-Key": idempotency_key },
+    });
+
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to submit APiXO batch.",
+          status: result.status,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: `/api/v1/generateTask/${model}/batches`,
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
+  "apixo_get_batch_status",
+  {
+    title: "Get Batch Status",
+    description:
+      "Fetch the current state, item states, and terminal public results for one APiXO batch. Uses the configured APIXO_API_KEY; the batch must belong to that API key's account.",
+    inputSchema: {
+      model: z.string().min(1).describe("Public model ID used when the batch was submitted."),
+      batchId: z.string().min(1).describe("Batch ID returned by apixo_submit_batch or the Batch Generate API."),
+    },
+  },
+  async ({ model, batchId }) => {
+    const cfg = getRuntimeConfig();
+    if (!cfg.apiKey) {
+      return missingKeyResult();
+    }
+
+    const result = await apixoRequest(
+      cfg,
+      "GET",
+      `/api/v1/generateTask/${encodeURIComponent(model)}/batches/${encodeURIComponent(batchId)}`,
+    );
+    if (!result.ok) {
+      return toTextResultWithUpdate(
+        {
+          ok: false,
+          error: result.error ?? "Failed to fetch APiXO batch status.",
+          status: result.status,
+          batchId,
+          response: result.envelope ?? result.rawText ?? null,
+        },
+        true,
+      );
+    }
+
+    return toTextResultWithUpdate({
+      ok: true,
+      endpoint: `/api/v1/generateTask/${model}/batches/${batchId}`,
+      batchId,
+      response: result.envelope ?? result.rawText ?? null,
+    });
+  },
+);
+
+server.registerTool(
   "apixo_get_task_status",
   {
     title: "Get Task Status",
-    description: "Fetch APiXO task status and result for a taskId.",
+    description: "Fetch APiXO task status and result for a taskId from a single task or an accepted batch item.",
     inputSchema: {
       model: z.string().min(1).describe("Model ID used to submit the task."),
-      taskId: z.string().min(1).describe("Task ID returned by generate_task."),
+      taskId: z.string().min(1).describe("Task ID returned by generate_task or an accepted batch item."),
     },
   },
   async ({ model, taskId }) => {
