@@ -8,9 +8,18 @@ import { homedir, hostname, platform } from "node:os";
 import { dirname, join } from "node:path";
 import * as z from "zod/v4";
 import { openBrowser } from "./browser.js";
+import { findModelIndexEntry, suggestModels, schemaProperties, enumInputErrors, type ModelSchemaIndexEntry } from "./models.js";
+import { sanitizeTaskStatus } from "./task-status.js";
+import { SetupPoller, type SetupCheck } from "./setup-poller.js";
+import { studioSessionFields, studioRunReferences } from "./studio-session.js";
 
 const SERVER_NAME = "apixo-mcp-server";
-const SERVER_VERSION = "0.3.2";
+const SERVER_VERSION = "0.4.0";
+const SERVER_ICON = {
+  src: `data:image/png;base64,${readFileSync(new URL("../assets/favicon-32x32.png", import.meta.url)).toString("base64")}`,
+  mimeType: "image/png",
+  sizes: ["32x32"],
+};
 const DEFAULT_BASE_URL = "https://api.apixo.ai";
 const API_KEY_ENV = "APIXO_API_KEY";
 const MCP_TOKEN_ENV = "APIXO_MCP_TOKEN";
@@ -19,6 +28,12 @@ const CREDENTIALS_PATH_ENV = "APIXO_MCP_CREDENTIALS_PATH";
 const CLIENT_TYPE_ENV = "APIXO_MCP_CLIENT_TYPE";
 const USER_AGENT = `${SERVER_NAME}/${SERVER_VERSION}`;
 const SERVER_INSTRUCTIONS = [
+  "APiXO model workflow: Understand the user's intended model and operation before spending money. If the model ID is uncertain, call apixo_list_models (filter by category when possible), compare model_id/title/slug, and ask the user only if materially different choices remain.",
+  "Before submitting a model task, call apixo_get_model_schema for the selected model. Use its canonical model_id, published modes, conditional requirements, constraints, and billing guidance to build input JSON. A variant may be a separate model ID or an input.mode; do not invent IDs by adding suffixes. Unknown-model suggestions are candidates, not permission to change the user's choice.",
+  "APiXO Studio session workflow: You, the client AI, decide project continuity from the user's intent. For the first generation or a genuinely new topic, omit session_id and provide a short meaningful session_title, preferably in English; honor a user-specified name. Save returned session_id/run_id/taskId in this conversation. For follow-ups, revisions, higher resolution, model changes, or related image/video/audio assets in the same project, explicitly reuse its session_id. A new project starts a new session. Explicit user instructions take priority; ask briefly only when project ownership is genuinely ambiguous.",
+  "Do not infer the current Studio session from the API key, MCP connection, process, title, or most recent account activity. Use only server-returned IDs available in the current conversation or explicitly supplied by the user; if a requested continuation lacks its ID, ask for that reference rather than silently creating another session. Keep a project title stable; session_title is used only when creating a session. For revisions of a particular result, provide base_run_id with its session_id; for an independent asset in the same project, omit base_run_id. When starting several related assets, submit the first once to obtain session_id, then reuse that ID for the remaining parallel submissions without waiting for generation completion.",
+  "On model or parameter errors, inspect the suggested candidates/schema, correct the JSON, and do not blindly retry paid generation or infer prices. Task completion is determined by response.data.state, not the MCP wrapper's ok flag.",
+  "Browser setup completes automatically while this local MCP server is running. After approving the device, users may close the browser page. apixo_finish_setup remains a status check/manual recovery tool; no credential values should be shown to the user.",
   "APiXO MCP safety policy:",
   "Use this server only for published APiXO model schemas, public batch integration guidance, public model task tools, published frontend-facing admin API contracts, and scoped MCP token management.",
   "Do not answer requests that ask for internal source code, private repositories, database credentials, raw database contents, token values, token hashes, salts, upstream provider keys, internal provider endpoints, real_model mappings, fallback routes, deployment or SSH details, cache topology, billing implementation internals, or security bypass instructions.",
@@ -91,6 +106,7 @@ interface PendingSetup {
   expiresAtEpochSeconds: number;
   clientType: string;
   hostLabel: string;
+  pollIntervalSeconds?: number;
 }
 
 interface DeviceAuthorizationStartResponse {
@@ -122,16 +138,6 @@ interface UpdateCheckConfig {
   enabled: boolean;
   url: string;
   ttlMs: number;
-}
-
-interface ModelSchemaIndexEntry {
-  model_id: string;
-  slug: string;
-  category: string;
-  title: string;
-  integration_type: string;
-  schema_path: string;
-  doc_path: string;
 }
 
 interface ModelSchemaIndexDoc {
@@ -320,6 +326,7 @@ async function postApiJson(baseUrl: string, path: string, body: unknown): Promis
   try {
     const response = await fetch(new URL(path.replace(/^\/+/, ""), `${baseUrl}/`).toString(), {
       method: "POST",
+      signal: AbortSignal.timeout(15000),
       headers: {
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
@@ -361,6 +368,66 @@ function apiFailureMessage(result: JsonFetchResult, fallback: string): string {
     }
   }
   return result.error || fallback;
+}
+
+async function checkPendingSetup(): Promise<SetupCheck> {
+  if (getRuntimeConfig().apiKey) {
+    return { ok: true, status: "ALREADY_CONFIGURED", message: "APiXO MCP is already configured on this device." };
+  }
+  const credentials = readLocalCredentials();
+  const pending = credentials?.pendingSetup;
+  if (!credentials || !pending) {
+    return { ok: false, status: "NO_PENDING_SETUP", message: "No setup is pending. Call apixo_setup first." };
+  }
+  if (pending.expiresAtEpochSeconds <= Math.floor(Date.now() / 1000)) {
+    writeLocalCredentials({ version: 1, installationId: credentials.installationId });
+    return { ok: false, status: "EXPIRED", message: "The setup approval expired. Call apixo_setup again." };
+  }
+  const completed = await postApiJson(getRuntimeConfig().baseUrl, "/api/mcp/device-authorization/poll", {
+    deviceCode: pending.deviceCode,
+    pollToken: pending.pollToken,
+  });
+  // 网络等待期间另一进程/调用可能完成或替换授权，不能用旧结果覆盖新凭证。
+  const latest = readLocalCredentials();
+  if (getRuntimeConfig().apiKey) {
+    return { ok: true, status: "ALREADY_CONFIGURED", message: "APiXO MCP is already configured on this device." };
+  }
+  if (latest?.pendingSetup?.deviceCode !== pending.deviceCode) {
+    return latest?.pendingSetup
+      ? { ok: true, status: "PENDING_APPROVAL", message: "A newer setup is pending.", pollIntervalSeconds: latest.pendingSetup.pollIntervalSeconds }
+      : { ok: false, status: "NO_PENDING_SETUP", message: "No setup is pending. Call apixo_setup first." };
+  }
+  const data = responseData<DeviceAuthorizationPollResponse>(completed);
+  if (!data || (data.status !== "PENDING" && data.status !== "AUTHORIZED")) {
+    const retry = completed.status === 0 || completed.status === 429 || completed.status >= 500;
+    return { ok: false, status: retry ? "RETRY" : "FAILED",
+      message: retry ? "Setup could not be checked yet. Automatic completion will retry."
+        : "Setup could not be completed. Call apixo_setup or apixo_finish_setup to retry.",
+      pollIntervalSeconds: pending.pollIntervalSeconds };
+  }
+  if (data.status === "PENDING") {
+    return { ok: true, status: "PENDING_APPROVAL", message: "Approve this device in the browser. This running MCP server will finish setup automatically.",
+      pollIntervalSeconds: data.pollIntervalSeconds ?? pending.pollIntervalSeconds };
+  }
+  if (typeof data.apiKey !== "string" || !data.apiKey.trim()) {
+    return { ok: false, status: "FAILED", message: "Setup returned an invalid credential response. Call apixo_finish_setup to retry." };
+  }
+  writeLocalCredentials({ version: 1, installationId: latest.installationId, apiKey: data.apiKey.trim() });
+  return { ok: true, status: "CONFIGURED", client_type: pending.clientType, host_label: pending.hostLabel,
+    message: "APiXO MCP is configured. The credential was saved privately on this device." };
+}
+
+const setupPoller = new SetupPoller(checkPendingSetup, () => {
+  const pending = readLocalCredentials()?.pendingSetup;
+  return pending ? pending.expiresAtEpochSeconds * 1000 : undefined;
+});
+let setupStartInFlight: Promise<Awaited<ReturnType<typeof toTextResultWithUpdate>>> | undefined;
+
+function startSetupOnce(operation: () => Promise<Awaited<ReturnType<typeof toTextResultWithUpdate>>>) {
+  if (!setupStartInFlight) {
+    setupStartInFlight = operation().finally(() => { setupStartInFlight = undefined; });
+  }
+  return setupStartInFlight;
 }
 
 function getBatchIntegrationGuideConfig(): BatchIntegrationGuideConfig {
@@ -421,6 +488,7 @@ async function fetchJson(url: string): Promise<JsonFetchResult> {
   try {
     const response = await fetch(url, {
       method: "GET",
+      signal: AbortSignal.timeout(15000),
       headers: {
         "User-Agent": USER_AGENT,
       },
@@ -963,27 +1031,6 @@ async function loadBatchIntegrationGuide(forceRefresh = false): Promise<
   return { ok: true, payload, guideUrl: cfg.url, cacheExpiresAt: expiresAt };
 }
 
-function findModelIndexEntry(index: ModelSchemaIndexDoc, model: string): ModelSchemaIndexEntry | null {
-  const lookup = model.trim().toLowerCase();
-  if (lookup.length === 0) {
-    return null;
-  }
-
-  for (const item of index.models) {
-    if (item.model_id.toLowerCase() === lookup) {
-      return item;
-    }
-  }
-
-  for (const item of index.models) {
-    if (item.slug.toLowerCase() === lookup) {
-      return item;
-    }
-  }
-
-  return null;
-}
-
 async function loadModelSchemaByPath(schemaPath: string): Promise<JsonFetchResult> {
   const cfg = getModelSchemaConfig();
   const fullUrl = /^https?:\/\//i.test(schemaPath)
@@ -993,10 +1040,63 @@ async function loadModelSchemaByPath(schemaPath: string): Promise<JsonFetchResul
   return fetchJson(fullUrl);
 }
 
+async function modelNotFoundResult(index: ModelSchemaIndexDoc, model: string) {
+  const suggestions = await Promise.all(suggestModels(index.models, model).map(async (candidate) => {
+    const schema = await loadModelSchemaByPath(candidate.schema_path);
+    return {
+      model_id: candidate.model_id, title: candidate.title, category: candidate.category,
+      parameter_options: schema.ok ? schemaProperties(schema.data)
+        .filter((field) => field.name === "mode" || field.name === "resolution") : [],
+    };
+  }));
+  return toTextResultWithUpdate({
+    ok: false, error_code: "MODEL_NOT_FOUND", error: `Model not found in schema index: ${model}`,
+    suggested_models: suggestions,
+    next_step: { tool: "apixo_list_models" },
+    hint: "Compare the user's intent with apixo_list_models, then call apixo_get_model_schema for the chosen canonical model_id. Variants can be modes or separate IDs. Do not automatically select a candidate or submit a paid task.",
+  }, true);
+}
+
+async function prepareGeneration(model: string, inputs: JsonObject[]): Promise<
+  | { ok: true; modelId: string; category: string }
+  | { ok: false; result: Awaited<ReturnType<typeof toTextResultWithUpdate>> }
+> {
+  let loaded = await loadModelSchemaIndex();
+  if (!loaded.ok) {
+    return { ok: false, result: await toTextResultWithUpdate({ ok: false, error_code: "MODEL_INDEX_UNAVAILABLE",
+      error: "Cannot verify the published model directory. Retry apixo_list_models before generation." }, true) };
+  }
+  let matched = findModelIndexEntry(loaded.payload.models, model);
+  // 模型刚上架时，刷新一次目录，避免旧缓存造成误报。
+  if (!matched) {
+    const refreshed = await loadModelSchemaIndex(true);
+    if (refreshed.ok) {
+      loaded = refreshed;
+      matched = findModelIndexEntry(refreshed.payload.models, model);
+    }
+  }
+  if (!matched) return { ok: false, result: await modelNotFoundResult(loaded.payload, model) };
+  const schema = await loadModelSchemaByPath(matched.schema_path);
+  if (!schema.ok) {
+    return { ok: false, result: await toTextResultWithUpdate({ ok: false, error_code: "MODEL_SCHEMA_UNAVAILABLE",
+      error: "Cannot read the selected model's published schema. Retry apixo_get_model_schema before generation.",
+      model: matched.model_id }, true) };
+  }
+  const errors = inputs.flatMap((input, index) => enumInputErrors(schema.data, input)
+    .map((error) => ({ ...error, ...(inputs.length > 1 ? { item_index: index } : {}) })));
+  if (errors.length) {
+    return { ok: false, result: await toTextResultWithUpdate({ ok: false, error_code: "INVALID_MODEL_INPUT", model: matched.model_id,
+      errors, next_step: { tool: "apixo_get_model_schema", arguments: { model: matched.model_id } },
+      hint: "Correct these fields using the schema and the user's intent. No generation was submitted." }, true) };
+  }
+  return { ok: true, modelId: matched.model_id, category: matched.category };
+}
+
 const server = new McpServer(
   {
     name: SERVER_NAME,
     version: SERVER_VERSION,
+    icons: [SERVER_ICON],
   },
   {
     instructions: SERVER_INSTRUCTIONS,
@@ -1007,7 +1107,7 @@ server.registerTool(
   "apixo_list_models",
   {
     title: "List Models",
-    description: "List APiXO models from the published model schema index.",
+    description: "Discover canonical model IDs, titles, categories, and schema locations. Call this when the user's model name is uncertain; compare candidates with the user's intent, then read apixo_get_model_schema before generation.",
     inputSchema: {
       category: z.string().optional().describe("Optional category filter, e.g. image, video, audio, text."),
       integration_type: z.string().optional().describe("Optional filter, e.g. task_api or llm_gateway."),
@@ -1059,7 +1159,7 @@ server.registerTool(
   "apixo_get_model_schema",
   {
     title: "Get Model Schema",
-    description: "Fetch one APiXO model schema document by model_id or slug.",
+    description: "Read the selected model's published modes, input fields, constraints, and available billing guidance before building generation JSON. Use the returned canonical model.model_id; a display-name suffix may be an input.mode rather than a separate model.",
     inputSchema: {
       model: z.string().min(1).describe("Model ID or slug, e.g. kling-2-6 or nano-banana."),
       force_refresh: z.boolean().optional().describe("When true, refresh schema index before lookup."),
@@ -1080,17 +1180,9 @@ server.registerTool(
       );
     }
 
-    const matched = findModelIndexEntry(loaded.payload, model);
+    const matched = findModelIndexEntry(loaded.payload.models, model);
     if (!matched) {
-      return toTextResultWithUpdate(
-        {
-          ok: false,
-          error: `Model not found in schema index: ${model}`,
-          source: loaded.sourceUrl,
-          hint: "Use apixo_list_models to inspect available model_id and slug values.",
-        },
-        true,
-      );
+      return modelNotFoundResult(loaded.payload, model);
     }
 
     const fetched = await loadModelSchemaByPath(matched.schema_path);
@@ -1183,7 +1275,7 @@ server.registerTool(
         .describe("Optional installing client identifier, e.g. codexCli, claudeCli, or claudeDesktop."),
     },
   },
-  async ({ client_type }) => {
+  ({ client_type }) => startSetupOnce(async () => {
     const cfg = getRuntimeConfig();
     if (cfg.apiKey) {
       return toTextResultWithUpdate({
@@ -1201,6 +1293,7 @@ server.registerTool(
       const nowEpochSeconds = Math.floor(Date.now() / 1000);
       const pending = existing?.pendingSetup;
       if (pending && pending.expiresAtEpochSeconds > nowEpochSeconds) {
+        setupPoller.start();
         const opened = await openBrowser(pending.verificationUrl);
         return toTextResultWithUpdate({
           ok: true,
@@ -1208,8 +1301,8 @@ server.registerTool(
           verification_url: pending.verificationUrl,
           browser_opened: opened,
           message: opened
-            ? "A setup approval is already pending. Finish signing in, then call apixo_finish_setup."
-            : "A setup approval is already pending. Open verification_url in your browser, then call apixo_finish_setup.",
+            ? "A setup approval is pending. Approve the device; this running MCP server finishes configuration automatically. You may close the browser after approval."
+            : "Open verification_url and approve the device. This running MCP server finishes configuration automatically; apixo_finish_setup is available for recovery.",
         });
       }
 
@@ -1243,9 +1336,11 @@ server.registerTool(
           expiresAtEpochSeconds: data.expiresAtEpochSeconds,
           clientType: selectedClientType,
           hostLabel,
+          pollIntervalSeconds: data.pollIntervalSeconds,
         },
       };
       writeLocalCredentials(nextCredentials);
+      setupPoller.start();
       const opened = await openBrowser(data.verificationUrl);
       return toTextResultWithUpdate({
         ok: true,
@@ -1254,8 +1349,8 @@ server.registerTool(
         browser_opened: opened,
         expires_at: new Date(data.expiresAtEpochSeconds * 1000).toISOString(),
         message: opened
-          ? "Finish signing in and approving this device in the browser, then call apixo_finish_setup."
-          : "Open verification_url in your browser, approve this device, then call apixo_finish_setup.",
+          ? "Sign in and approve this device in the browser. This running MCP server will save the credential automatically; you may close the browser after approval."
+          : "Open verification_url and approve this device. This running MCP server will save the credential automatically; apixo_finish_setup is available for recovery.",
       });
     } catch (error) {
       return toTextResultWithUpdate(
@@ -1266,7 +1361,7 @@ server.registerTool(
         true,
       );
     }
-  },
+  }),
 );
 
 server.registerTool(
@@ -1274,84 +1369,14 @@ server.registerTool(
   {
     title: "Finish APiXO Setup",
     description:
-      "Check whether the browser approval completed. On success, stores the API key in this MCP server's private local credential file without returning it.",
+      "Check setup status or manually recover setup. Browser approval normally completes automatically while this MCP server runs. No credential is returned.",
     inputSchema: {},
   },
   async () => {
-    const cfg = getRuntimeConfig();
-    if (cfg.apiKey) {
-      return toTextResultWithUpdate({
-        ok: true,
-        status: "ALREADY_CONFIGURED",
-        message: "APiXO MCP already has a local credential or an APIXO_API_KEY override.",
-      });
-    }
-
-    const credentials = readLocalCredentials();
-    const pending = credentials?.pendingSetup;
-    if (!credentials || !pending) {
-      return toTextResultWithUpdate(
-        {
-          ok: false,
-          error: "No APiXO setup is pending. Call apixo_setup first.",
-        },
-        true,
-      );
-    }
-    if (pending.expiresAtEpochSeconds <= Math.floor(Date.now() / 1000)) {
-      writeLocalCredentials({ version: 1, installationId: credentials.installationId });
-      return toTextResultWithUpdate(
-        {
-          ok: false,
-          error: "The APiXO setup approval expired. Call apixo_setup again.",
-        },
-        true,
-      );
-    }
-
-    const completed = await postApiJson(cfg.baseUrl, "/api/mcp/device-authorization/poll", {
-      deviceCode: pending.deviceCode,
-      pollToken: pending.pollToken,
-    });
-    const data = responseData<DeviceAuthorizationPollResponse>(completed);
-    if (!data || (data.status !== "PENDING" && data.status !== "AUTHORIZED")) {
-      return toTextResultWithUpdate(
-        {
-          ok: false,
-          error: apiFailureMessage(completed, "APiXO setup could not be completed."),
-        },
-        true,
-      );
-    }
-    if (data.status === "PENDING") {
-      return toTextResultWithUpdate({
-        ok: true,
-        status: "PENDING_APPROVAL",
-        message: "Browser approval has not completed yet. Finish the APiXO sign-in flow, then call apixo_finish_setup again.",
-      });
-    }
-    if (typeof data.apiKey !== "string" || data.apiKey.trim().length === 0) {
-      return toTextResultWithUpdate(
-        {
-          ok: false,
-          error: "APiXO setup returned an invalid credential response.",
-        },
-        true,
-      );
-    }
-
-    writeLocalCredentials({
-      version: 1,
-      installationId: credentials.installationId,
-      apiKey: data.apiKey.trim(),
-    });
-    return toTextResultWithUpdate({
-      ok: true,
-      status: "CONFIGURED",
-      client_type: pending.clientType,
-      host_label: pending.hostLabel,
-      message: "APiXO MCP is configured on this device. The credential is stored locally and was not returned.",
-    });
+    const result = await setupPoller.pollOnce();
+    if (result.status === "PENDING_APPROVAL" || result.status === "RETRY") setupPoller.start();
+    else setupPoller.stop();
+    return toTextResultWithUpdate({ ...result, ...(!result.ok ? { error: result.message } : {}) }, !result.ok);
   },
 );
 
@@ -1780,46 +1805,42 @@ server.registerTool(
   "apixo_generate_task",
   {
     title: "Generate Task",
-    description: "Submit an APiXO generation task with model-specific input parameters.",
+    description: "Submit one paid asynchronous generation visible in Studio Recent after model discovery and apixo_get_model_schema. Decide from the user's intent: first generation/new topic = omit session_id and supply a concise preferably English session_title; related follow-ups/model changes = reuse the returned session_id. For revising a result also supply base_run_id; omit it for an independent asset. Keep returned IDs in this conversation, never infer a globally current session, and do not automatically resubmit after an uncertain response. A taskId means accepted, not completed.",
     inputSchema: {
-      model: z.string().min(1).describe("Model ID, such as nano-banana, flux-2, or sora-2."),
+      model: z.string().min(1).describe("Canonical model_id selected using apixo_list_models and apixo_get_model_schema."),
       input: z
         .record(z.string(), z.unknown())
         .describe("Model-specific input payload. Example: { mode, prompt, aspect_ratio }."),
-      request_type: z.enum(["async", "callback"]).optional().describe("Result mode. Defaults to async."),
-      callback_url: z.string().url().optional().describe("Required when request_type is callback."),
-      source: z.string().optional().describe("Optional source tag."),
+      session_title: z.string().optional().describe("Required when creating a session: a short project name, preferably English (e.g. Celestial Palace Exploration), or the user's chosen name. Used only when session_id is omitted; never rename a continuing project implicitly."),
+      session_id: z.string().trim().min(1).optional().describe("Server-returned sessionId for the project being continued. Reuse for related assets and model changes; omit only for the first generation or a new topic."),
+      base_run_id: z.string().trim().min(1).optional().describe("Server-returned runId being revised or regenerated. Requires its session_id and appends a version to that result; omit for an independent asset in the same project."),
+      request_type: z.enum(["async", "callback"]).optional().describe("Studio generation supports async (default). Legacy callback values return guidance without submitting a task."),
+      callback_url: z.string().url().optional().describe("Legacy compatibility parameter. Studio generation does not support callback_url; use asynchronous task polling."),
     },
   },
-  async ({ model, input, request_type, callback_url, source }) => {
+  async ({ model, input, session_title, session_id, base_run_id, request_type, callback_url }) => {
     const cfg = getRuntimeConfig();
     if (!cfg.apiKey) {
       return missingKeyResult();
     }
 
-    const finalRequestType = request_type ?? "async";
-    if (finalRequestType === "callback" && !callback_url) {
-      return toTextResultWithUpdate(
-        {
-          ok: false,
-          error: "callback_url is required when request_type is callback.",
-        },
-        true,
-      );
+    const prepared = await prepareGeneration(model, [input]);
+    if (!prepared.ok) return prepared.result;
+    const session = studioSessionFields({ session_title, session_id, base_run_id, request_type, callback_url });
+    if (!session.ok) return toTextResultWithUpdate(session, true);
+    if (!["image", "video", "audio", "text"].includes(prepared.category)) {
+      return toTextResultWithUpdate({ ok: false, error_code: "MODEL_CATEGORY_UNSUPPORTED",
+        error: "The published model category is not supported by Studio generation. No task was submitted.", model: prepared.modelId }, true);
     }
 
     const payload: JsonObject = {
-      request_type: finalRequestType,
-      input,
+      ...session.fields,
+      model_name: prepared.modelId,
+      category: prepared.category,
+      request: { request_type: "async", input },
     };
-    if (callback_url) {
-      payload.callback_url = callback_url;
-    }
-    if (source) {
-      payload.source = source;
-    }
-
-    const result = await apixoRequest(cfg, "POST", `/api/v1/generateTask/${encodeURIComponent(model)}`, {
+    const endpoint = "/api/v1/web/generations/mcp";
+    const result = await apixoRequest(cfg, "POST", endpoint, {
       body: payload,
     });
 
@@ -1827,18 +1848,32 @@ server.registerTool(
       return toTextResultWithUpdate(
         {
           ok: false,
-          error: result.error ?? "Failed to call APiXO generate task endpoint.",
+          error: result.error ?? "Failed to call APiXO Studio generation endpoint.",
           status: result.status,
           response: result.envelope ?? result.rawText ?? null,
+          hint: "Inspect this error. Do not automatically submit a replacement task or create a new session; after a network/server error, acceptance may be unknown.",
         },
         true,
       );
     }
+    const references = studioRunReferences(result.envelope, session_id);
+    if (!references) {
+      return toTextResultWithUpdate({ ok: false, error_code: "STUDIO_RESPONSE_UNCONFIRMED", endpoint,
+        response: sanitizeTaskStatus(result.envelope ?? result.rawText ?? null),
+        hint: "The response does not confirm the requested session and task references. A task may already have been accepted; do not automatically resubmit or create another session." }, true);
+    }
 
     return toTextResultWithUpdate({
       ok: true,
-      endpoint: `/api/v1/generateTask/${model}`,
-      response: result.envelope ?? result.rawText ?? null,
+      endpoint,
+      model: prepared.modelId,
+      session_id: references.sessionId,
+      run_id: references.runId,
+      taskId: references.taskId,
+      session_created: session.created,
+      ...(session.created ? { session_title: session.fields.title } : {}),
+      hint: "Save these IDs for this project. Reuse session_id for related follow-ups; include run_id as base_run_id only when revising this result. Poll apixo_get_task_status using model and taskId; accepted does not mean completed.",
+      response: sanitizeTaskStatus(result.envelope ?? result.rawText ?? null),
     });
   },
 );
@@ -1848,7 +1883,7 @@ server.registerTool(
   {
     title: "Submit Batch",
     description:
-      "Submit 1 to 50 asynchronous APiXO generation tasks for one model. Uses the configured APIXO_API_KEY. Provide stable batch and item idempotency keys; use webhook_url only after configuring the signing secret through the REST API or Dashboard.",
+      "Submit 1 to 50 paid asynchronous tasks for one model after model discovery and apixo_get_model_schema. Use its canonical model_id and schema-defined input. Provide stable batch and item idempotency keys; use webhook_url only after configuring the signing secret through the REST API or Dashboard.",
     inputSchema: {
       model: z.string().min(1).describe("Public model ID for every item in the batch."),
       idempotency_key: z
@@ -1884,12 +1919,14 @@ server.registerTool(
       return missingKeyResult();
     }
 
+    const prepared = await prepareGeneration(model, items.map((item) => item.input));
+    if (!prepared.ok) return prepared.result;
     const body: JsonObject = { items };
     if (webhook_url) {
       body.webhook_url = webhook_url;
     }
 
-    const result = await apixoRequest(cfg, "POST", `/api/v1/generateTask/${encodeURIComponent(model)}/batches`, {
+    const result = await apixoRequest(cfg, "POST", `/api/v1/generateTask/${encodeURIComponent(prepared.modelId)}/batches`, {
       body,
       headers: { "Idempotency-Key": idempotency_key },
     });
@@ -1908,8 +1945,8 @@ server.registerTool(
 
     return toTextResultWithUpdate({
       ok: true,
-      endpoint: `/api/v1/generateTask/${model}/batches`,
-      response: result.envelope ?? result.rawText ?? null,
+      endpoint: `/api/v1/generateTask/${prepared.modelId}/batches`,
+      response: sanitizeTaskStatus(result.envelope ?? result.rawText ?? null),
     });
   },
 );
@@ -1953,7 +1990,7 @@ server.registerTool(
       ok: true,
       endpoint: `/api/v1/generateTask/${model}/batches/${batchId}`,
       batchId,
-      response: result.envelope ?? result.rawText ?? null,
+      response: sanitizeTaskStatus(result.envelope ?? result.rawText ?? null),
     });
   },
 );
@@ -1994,7 +2031,7 @@ server.registerTool(
       ok: true,
       endpoint: `/api/v1/statusTask/${model}`,
       taskId,
-      response: result.envelope ?? result.rawText ?? null,
+      response: sanitizeTaskStatus(result.envelope ?? result.rawText ?? null),
     });
   },
 );
@@ -2035,7 +2072,7 @@ server.registerTool(
 async function main(): Promise<void> {
   const cfg = getRuntimeConfig();
   if (!cfg.apiKey) {
-    console.error(`[${SERVER_NAME}] Warning: ${API_KEY_ENV} is not set. Tool calls will fail until it is provided.`);
+    console.error(`[${SERVER_NAME}] Run apixo_setup for browser sign-in. Pending setup resumes automatically while this server runs.`);
   }
 
   const schemaCfg = getModelSchemaConfig();
@@ -2059,6 +2096,8 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  server.server.onclose = () => setupPoller.stop();
+  if (!getRuntimeConfig().apiKey && readLocalCredentials()?.pendingSetup) setupPoller.start();
   console.error(`${SERVER_NAME} started on stdio`);
 }
 

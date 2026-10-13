@@ -1,6 +1,6 @@
 {
   "name": "@apixo/mcp-server",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "APiXO MCP server for local tool integrations",
   "type": "module",
   "private": false,
@@ -11,6 +11,7 @@
   },
   "files": [
     "dist",
+    "assets",
     "README.md",
     "docs"
   ],
@@ -18,7 +19,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "check": "tsc --noEmit",
-    "test": "tsx --test test/browser.test.ts",
+    "test": "tsx --test test/*.test.ts",
     "prepare": "npm run build"
   },
   "keywords": [
@@ -32,7 +33,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
