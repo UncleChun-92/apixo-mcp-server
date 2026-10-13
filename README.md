@@ -4,7 +4,7 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 
 ## Features
 
-- `apixo_generate_task`: submit a generation task to APiXO
+- `apixo_generate_task`: submit an asynchronous generation in a named Studio session, visible in Recent
 - `apixo_setup` / `apixo_finish_setup`: sign in through the browser and configure this local installation
 - `apixo_get_task_status`: query task status/result by `taskId`
 - `apixo_submit_batch`: submit 1-50 asynchronous tasks for one model
@@ -24,6 +24,7 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 - `apixo_disable_mcp_user`: disable an MCP user (`mcp-token:manage`)
 - `apixo_list_mcp_access_logs`: list recent MCP access logs (`mcp-token:manage`)
 - Automatic version update reminder (npm registry check with cache)
+- APiXO website favicon bundled in `assets/favicon-32x32.png` and sent as an embedded PNG in MCP server metadata; icon display depends on client support and needs no CDN request.
 
 ## Requirements
 
@@ -33,7 +34,7 @@ APiXO MCP server (stdio) for AI clients such as Codex, Cursor, and Claude Deskto
 
 ## Environment Variables
 
-- `APIXO_API_KEY` (required): your APiXO key
+- `APIXO_API_KEY` (optional): explicit local override; normal browser setup stores the key privately
 - `APIXO_MCP_CREDENTIALS_PATH` (optional): override the private local MCP credential-file location
 - `APIXO_MCP_CLIENT_TYPE` (optional): installation label, e.g. `codexCli`, `claudeCli`, or `claudeDesktop`
 - `APIXO_MCP_TOKEN` (optional): MCP token for admin contract read tools; if it also has `mcp-token:manage`, it can use MCP user/key management tools
@@ -63,7 +64,9 @@ new `mcp-token:manage` token.
 ## Browser Setup
 
 For normal local use, start without `APIXO_API_KEY` and call `apixo_setup`. The MCP server opens APiXO
-in the browser; after the user signs in and approves the current device, call `apixo_finish_setup`.
+in the browser. Keep the MCP server running: after browser approval it polls automatically and saves
+the credential, even if the browser page is closed. Pending setup resumes on restart until its authorization
+expires. `apixo_finish_setup` remains available to check status or recover manually.
 The resulting API key is written to a private local credential file that the MCP server reads on later
 starts. It is never returned in a tool response.
 
@@ -71,6 +74,64 @@ starts. It is never returned in a tool response.
 Set `APIXO_MCP_CLIENT_TYPE` in the client configuration to make the corresponding API Key entry easy to
 identify in the APiXO dashboard. The server uses the local installation ID plus this client type to reuse
 the same key on later starts; a fresh installation creates its own key.
+
+## Model Task Workflow
+
+Understand the user's intent → call `apixo_list_models` when the model is uncertain → read
+`apixo_get_model_schema` → build schema-defined input JSON → call `apixo_generate_task`.
+Use the canonical `model_id`; a variant may be an input mode or a separate model ID. Unknown-model
+errors include candidate models and their published mode/resolution options for the client AI to interpret.
+Generation verifies the model and explicitly published input enums before submission; other parameter
+validation remains with the backend. Unknown fields are passed through. No paid task is submitted when
+model discovery/schema retrieval or these enum checks fail.
+
+## Studio Session Workflow
+
+The client AI decides whether the user is continuing a creative project or starting a new topic:
+
+1. First generation/new topic: omit `session_id` and provide a concise `session_title`, preferably in
+   English (for example, `Celestial Palace Exploration`). Honor a name explicitly chosen by the user.
+2. Save the returned `session_id`, `run_id`, `taskId`, and canonical `model` in the current conversation.
+   A successful submission confirms acceptance, not completion; poll `apixo_get_task_status` with `model`
+   and `taskId` for the result.
+3. Related follow-ups, model changes, higher resolution, or related image/video/audio assets: explicitly
+   reuse `session_id`. A new topic omits it and supplies a new title. User instructions take priority;
+   ask briefly only when project ownership is ambiguous or a requested continuation lacks its ID.
+4. Revision/regeneration of a particular result: also pass its `run_id` as `base_run_id` to append a
+   version. For an independent asset in the same project, omit `base_run_id`.
+5. For several related assets, submit the first once to obtain `session_id`; the remaining submissions
+   may then run in parallel using that ID, without waiting for the first generation to complete.
+
+Example first submission (read the selected model's current schema before building `input`):
+
+```json
+{
+  "model": "seedream-4-0",
+  "session_title": "Celestial Palace Exploration",
+  "input": {
+    "mode": "text-to-image",
+    "prompt": "A celestial palace above a sea of clouds.",
+    "max_images": 1,
+    "resolution": "1K",
+    "aspect_ratio": "1:1",
+    "sequential_image_generation": "disabled"
+  }
+}
+```
+
+`session_title` is required only for new sessions and is ignored on continuations, so follow-ups do not
+implicitly rename a project. The server has no globally current session and never infers one from an
+API key, connection, title, or recent account activity. Conversation context must retain the returned
+IDs; users may explicitly supply a known ID to resume a project after a client restart or in another chat.
+Backend ownership checks still apply. Session errors never trigger a fallback creation or paid retry.
+
+Single-task Studio generation always uses asynchronous polling. The legacy `request_type=callback`
+and `callback_url` parameters return guidance without submitting a task; callback generation remains
+available through the published REST API. Existing batch tools keep their separate batch workflow and
+do not create Studio sessions. This change requires the deployed Studio MCP generation endpoint.
+
+Read task `state` to determine completion. MCP task responses omit `completeTime` for `pending`,
+`processing`, and `processing_r2`; terminal timestamps and backend behavior are preserved.
 
 ## Safety Policy
 
